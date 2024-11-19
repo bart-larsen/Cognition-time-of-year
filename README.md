@@ -1,7 +1,7 @@
-# paper-template
-A template repository for scientific projects.
+# School’s Out for the Summer: Cognition Varies Across the Calendar Year in Multiple Large-Scale Datasets
+This contains the code used for all analyses and figures in the manuscript. 
 
-## File organization on CUBIC
+## File organization 
 
 ```
 /path/to/project/
@@ -9,9 +9,6 @@ A template repository for scientific projects.
         |-  figures/    # Any figures for the manuscript
         |_  data/       # Tabular data that may be shared on GitHub
     |-  data/
-    |-  results/        # Results that cannot be shared on GitHub
-    |_  reproduction/
-        |-  code/       # Local clone of reproducibilibuddy's fork of GitHub repository
-        |-  data/       # Any data that must be copied and not referenced
-        |_  results/
+    |-  figures/        # figures that did not go in the paper
+
 ```
