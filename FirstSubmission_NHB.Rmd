@@ -1,0 +1,3549 @@
+---
+title: "ABCD day-of-year and cognition"
+author: "Bart Larsen"
+date: '2023-03-15'
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(mgcv)
+library(gratia)
+library(gtsummary)
+library(data.table)
+library(purrr)
+library(effectsize)
+library(broom)
+library(circular)
+library(ggsci)
+library(factoextra)
+library(gt)
+
+source("Tools/GAMM_plotting2.R")
+source("Tools/GAM_Effects.R")
+source("~/Library/CloudStorage/Box-Box/Work/PennLINC/Code/Tools/GAM_Posterior_circular_min_max.R")
+source("Tools/Partial.Residual.Plot.R")
+knitr::opts_chunk$set(warning = FALSE,echo=FALSE,message = FALSE)
+theme_set(theme_classic(base_size = 16) +
+            theme(
+              text = element_text(size = 16, color = "black"),
+              axis.title = element_text(size = 16, color = "black"),
+              axis.text = element_text(size = 16, color = "black"),
+              plot.title = element_text(size = 16, color = "black"),
+              legend.text = element_text(size = 16, color = "black"),
+              legend.title = element_text(size = 16, color = "black")
+            )
+)
+```
+
+
+```{r functions, echo=FALSE}
+#### Custom Functions ####
+
+# Calculate the circular median and confidence interval for day-of-year (DOY) data
+# Args:
+#   data: Numeric vector of DOY values (1–365.25)
+# Returns:
+#   A list containing the circular median and 95% confidence interval
+circular_median_with_ci <- function(data) {
+  # Convert DOY to radians
+  radian.data <- (data - 1) * (2 * pi) / 365.25
+  radian.data <- circular(radian.data, units = "radians")
+  
+  # Compute circular median
+  median.radian <- median.circular(radian.data)
+  median.day <- (median.radian * 365.25 / (2 * pi)) + 1
+  if (median.day < 0.1) median.day <- median.day + 365.25
+  
+  # Compute circular confidence interval
+  alpha <- 0.025
+  lower.radian <- quantile.circular(radian.data, probs = alpha)
+  upper.radian <- quantile.circular(radian.data, probs = 1 - alpha)
+  
+  # Map confidence intervals back to DOY
+  lower.day <- (lower.radian * 365.25 / (2 * pi)) + 1
+  upper.day <- (upper.radian * 365.25 / (2 * pi)) + 1
+  
+  return(list(median = median.day, ci.lower = lower.day, ci.upper = upper.day))
+}
+
+# Create a circular histogram with median and confidence intervals
+# Args:
+#   data: Numeric vector of DOY values
+# Returns:
+#   A ggplot object
+plot_circular_histogram <- function(data) {
+  # Calculate median and confidence intervals
+  result <- circular_median_with_ci(data)
+  median_day <- result$median
+  
+  # Prepare data for plotting
+  df <- data.frame(DayOfYear = (data - 1) * (2 * pi) / 365.25, stringsAsFactors = FALSE)
+  
+  # Create histogram
+  p <- ggplot(df, aes(x = DayOfYear)) +
+    geom_histogram(binwidth = 2 * pi / 12, boundary = 0, color = "black", fill = "blue") +
+    coord_polar(start = -pi / 12) +  # Align January with top position
+    theme_minimal() +
+    labs(title = "Circular Histogram with Median and 95% CI")
+  
+  # Add median and confidence intervals
+  p <- p + geom_vline(xintercept = median_day, color = "red", linetype = "dashed", size = 1) +
+    geom_vline(xintercept = result$ci.lower, color = "blue", linetype = "dashed", size = 0.5) +
+    geom_vline(xintercept = result$ci.upper, color = "blue", linetype = "dashed", size = 0.5)
+  
+  return(p)
+}
+
+# Analyze posterior distributions for circular GAM terms
+# Args:
+#   predicted.smooth.values: Data frame with predicted smooth values from a GAM
+#   make_plot: Logical, whether to produce diagnostic plots
+# Returns:
+#   Circular median and confidence intervals
+circular_posterior_analysis <- function(predicted.smooth.values, make_plot = FALSE) {
+  # Extract minimum DOY for each posterior draw
+  min.y.range.wide <- predicted.smooth.values %>%
+    summarise(across(contains("draw"), ~ as.numeric(predicted.smooth.values[which.min(.x), "doy"])))
+  min.y.range <- min.y.range.wide %>%
+    pivot_longer(contains("draw"), names_to = "draw", values_to = "min.y.range")
+  mci <- circular_median_with_ci(min.y.range$min.y.range)
+  
+  # Create plot if requested
+  if (make_plot) {
+    p <- ggplot(min.y.range, aes(x = min.y.range)) +
+      geom_histogram() +
+      geom_vline(xintercept = mci$median, color = "blue", show.legend = TRUE) +
+      geom_vline(xintercept = mci$ci.lower, color = "red", linetype = 2) +
+      geom_vline(xintercept = mci$ci.upper, color = "red", linetype = 2) +
+      xlim(c(0, 360)) +
+      coord_polar(start = -pi / 12)
+    print(p)
+  }
+  
+  return(mci)
+}
+
+# Helper function to map DOY to month names for visualization
+# Args:
+#   doy: Numeric vector of DOY values
+# Returns:
+#   Character vector of month names
+doy_to_month <- function(doy) {
+  as.character(format(as.Date(doy, origin = "2023-01-01"), "%B"))
+}
+
+```
+
+# ABCD Data
+
+```{r load data, echo = FALSE, }
+abcd.names<-fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/ABCD/ABCD_pull/abcd_tabulated_data-20230412/abcd_tbss01.txt',,na.strings = c("777"))
+abcd<-fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/ABCD/ABCD_pull/abcd_tabulated_data-20230412/abcd_tbss01.txt',,na.strings = c("777"),skip = 2)
+names(abcd)=names(abcd.names)
+
+factorscores <- readRDS('~/Box/Work/UMN/Projects/Cognition_TOY/Data/ABCD/DEAP-data-download_ThompsonScores_ResFamIncome.rds')%>%
+  filter(event_name=="baseline_year_1_arm_1")
+
+exosomes <- fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/ABCD/abcd_longitudinal_factor_scores_7f_bifactor.csv')%>%
+  mutate(eventname=Timepoint,src_subject_id=ID)
+
+abcdy1 <- abcd %>% filter(eventname=="baseline_year_1_arm_1")%>%
+  left_join(factorscores)%>%
+  left_join(exosomes)
+#Get Day of Week
+weekdaykey<-data.frame(weekday=
+                         c("Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday","Monday"),
+                       weekdaynum=
+                         c(1,2,3,4,5,6,7))
+# mutate variables 
+abcdy1 <- abcdy1%>%
+  mutate(int_date=as.Date(interview_date,format = "%m/%d/%Y"))%>%
+  mutate(visit_rank = rank(interview_date))%>%
+  mutate(weekday = weekdays(int_date))%>%
+  mutate(monthnum=month(int_date))%>%
+  mutate(doy = yday(int_date))%>%
+  mutate(age = as.numeric(interview_age)*30.4375, #age in days
+         sex=factor(sex,levels=c("M","F"),labels = c("Male","Female")),
+         osex=ordered(sex))%>%
+  left_join(weekdaykey)%>%
+  mutate(across(contains("uncorrected"), as.numeric))
+setDT(abcdy1)
+
+# Get participants data split
+## The important column is "matched_group".
+participants <- fread('Data/ABCD/participants_v1.0.3/participants.tsv',sep = "\t")%>%
+  mutate(session_id=tolower(session_id))
+abcd.df <- abcdy1 %>%
+  mutate(participant_id = sub(replacement = "",pattern="_",x = paste0("sub-",src_subject_id),fixed=TRUE),
+         session_id = gsub(replacement = "", pattern = "_", x = paste0("ses-",eventname),fixed=TRUE))%>%
+  left_join(participants,by=c("participant_id", "session_id"),suffix = c("","y"))
+
+# Get site (this is now included with participants.tsv)
+site <- readRDS("~/Box/Work/UMN/Projects/Cognition_TOY/Data/ABCD/DEAP-siteID.rds")%>% filter(event_name=="baseline_year_1_arm_1")
+
+abcd.df <- abcd.df %>% left_join(site)%>%
+  mutate(rel_family_id=factor(rel_family_id),
+         src_subject_id=factor(src_subject_id),
+         eventname = factor(eventname))
+
+remove(abcd.cbcl.names,abcd.names,exosomes,factorscores,screen.time,screen.time.names,site,abcdy1,participants,abcd)
+```
+
+## All ABCD factors
+
+Here we apply the analysis pipeline to all the factors from ABCD.  
+The following blocks of code fit the models and make tables of fit stats and then make plots.  
+
+### Whole sample
+
+Fit the models for each factor across the whole sample.  
+
+#### Monthly variation
+Figure S1. Cognition varies by month of the year.  
+
+```{r,echo=FALSE , fig.height=4, fig.width=3}
+# Convert to long format
+longdf <- abcd.df %>% pivot_longer(cols = c(contains("neurocog_pc")),names_to = "Factor",values_to = "score")%>%
+  mutate(Factor = factor(Factor,levels=c("neurocog_pc1.bl","neurocog_pc2.bl","neurocog_pc3.bl"),labels=c("General Cognition", "Executive Function", "Learning/Memory"))) %>% 
+  mutate(monthnum = factor(monthnum))
+
+# Fit a gam for each level of Factor that simply models month with age and sex as covariates
+model_output <- longdf %>%
+  group_by(Factor) %>%
+  summarise(model = list(bam( 
+    score ~ 
+      s(age)+
+      monthnum + 
+      sex +
+      s(abcd_site, bs = "re"),
+    method = "REML")))
+
+# Plot each model 
+plot.data.abcd <-  model_output%>% 
+  mutate(plot.df = map(.x=model,
+                       .f=~ make.plot.df(.x,term = "monthnum")))%>%
+  unnest(plot.df) %>%
+  select(-model)
+
+# Plot the effect of month on cognition. Plot One row for each factor.
+month.plot <- ggplot(plot.data.abcd,
+                      aes(x = monthnum.raw, y = fit, ymin = lwr, ymax = upr)) +
+  geom_point() +
+  geom_linerange() +
+  scale_color_brewer(type = "qual", palette = "Reds", direction = -1) +
+  scale_fill_brewer(type = "qual", palette = "Reds", direction = -1) +
+  scale_x_discrete(breaks = seq(1, 12, by = 1), labels = month.abb)+
+  theme_classic() +
+  facet_wrap(~Factor, ncol = 1) +
+  ylab("Performance") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+        axis.title.x = element_blank(),
+        legend.title = element_blank(),
+        legend.position = "none") 
+month.plot
+
+cowplot::save_plot('Figs/SupplementaryFigure1_month.svg',month.plot,base_height = 4,base_width = 3)
+```
+## Cyclical GAM analyses
+Fit day-of-year as a cyclical smoothing function.  
+
+```{r}
+# Reshape and reformat data for modeling
+longdf <- abcd.df %>% 
+  pivot_longer(
+    cols = c(contains("neurocog_pc")),
+    names_to = "Factor",
+    values_to = "score"
+  ) %>%
+  mutate(
+    Factor = factor(
+      Factor,
+      levels = c("neurocog_pc1.bl", "neurocog_pc2.bl", "neurocog_pc3.bl"),
+      labels = c("General Cognition", "Executive Function", "Learning/Memory")
+    )
+  )
+
+# Fit separate models for each cognitive factor
+model_output <- longdf %>%
+  group_by(Factor) %>%
+  summarise(model = list(bam(
+    score ~ 
+      s(age)+
+      s(weekdaynum, bs = "cc", k = 7) + # Cyclical smooth for day of the week
+      s(doy, bs = "cc", k = 52) + # Cyclical smooth for day of the year
+      s(doy, abcd_site, bs = "sz", xt = list(bs="cc",k=26)) + # Interaction smooth and offset for site
+      sex,
+    method = "REML")),
+    reduced_model = list(
+      bam(
+        score ~ 
+          s(age)+
+          s(weekdaynum, bs = "cc", k = 7) +
+          s(abcd_site, bs = "re") +
+          sex,
+        method = "REML")))
+
+# Extract model summaries and tidy outputs
+tidy_model <- model_output %>%
+  mutate(
+    tidy = map(model, function(x) {
+      tidydf <- broom::tidy(x)
+      tidydf$N <- length(x$residuals)
+      tidydf
+    })
+  ) %>%
+  unnest(tidy) %>%
+  select(-model, -reduced_model) %>%
+  filter(str_detect(string = term, pattern = "s\\(doy\\)")) %>%
+  mutate(pfdr = p.adjust(p.value)) %>%
+  relocate(N, .before = "edf")
+
+# Display tidy output in a styled table
+tidy_model %>% 
+  kableExtra::kbl(escape = F) %>%
+  kableExtra::kable_classic(html_font = "Cambria")
+
+# Compute partial R² values for each model
+r2_model <- model_output %>%
+  mutate(
+    partialr2 = map2(.x = model, .y = reduced_model, .f = ~partialR2(full_mod = .x, reduced_mod = .y))
+  ) %>%
+  unnest(partialr2) %>%
+  select(-model, -reduced_model)
+
+# Display partial R² table
+r2_model %>% 
+  kableExtra::kbl(escape = F) %>%
+  kableExtra::kable_classic(html_font = "Cambria")
+
+# Generate predictions for the partial regression plot
+newdf <- with(
+  abcd.df,
+  expand_grid(
+    age = median(age),
+    doy = seq(from = 1, to = 365, by = .2),
+    weekdaynum = 2,
+    sex = "Male",
+    abcd_site = "site_04"
+  )
+)
+
+plot.data.abcd <- model_output %>%
+  mutate(
+    plot.df = map(
+      .x = model,
+      .f = ~ make.plot.df(.x, term = "doy", newdata = newdf, add.intercept = FALSE, show.data = T) %>%
+        mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw), orders = "j"))
+    )
+  ) %>%
+  unnest(plot.df) %>%
+  select(-model, -reduced_model)
+
+# Extract minima from the day-of-year smooth terms
+abcd.factors.mins <- model_output %>%
+  mutate(
+    minmax = map(
+      .x = model,
+      .f = ~ gam.posterior.smooths.circular(.x, return_draws = FALSE, smooth_var = "doy")
+    )
+  ) %>%
+  unnest(minmax) %>%
+  select(Factor, minmax) %>%
+  unnest(minmax) %>%
+  filter(is.na(max.y)) %>%
+  mutate(across(.cols = where(is.numeric), .fns = ~lubridate::parse_date_time(as.character(floor(.)), orders = "j")))
+
+# Merge model outputs into a single summary table
+table.whole.sample <- left_join(tidy_model, r2_model) %>%
+  select(Factor, N, edf, partialr2, p.value, pfdr)
+
+# Save the summary table to a CSV file
+write.table(table.whole.sample, file = "ABCD_table_whole_sample.csv", quote = F, row.names = F, sep = ",")
+
+```
+
+#### Plot results
+
+Now plot the ToY effect and plot the day of minimum performance on a polar plot.  
+
+```{r,echo=FALSE}
+
+# Build the line plot depicting the ToY effect. 
+line.plot <- ggplot(plot.data.abcd,
+                      aes(x = doy.raw, y = fit, color = Factor, fill = Factor, ymin = lwr, ymax = upr)) +
+  geom_ribbon(alpha = .1, color = NA) +
+  geom_line() +
+  scale_color_brewer(type = "seq", palette = "Reds", direction = -1) +
+  scale_fill_brewer(type = "seq", palette = "Reds", direction = -1) +
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
+  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+        axis.title.x = element_blank(),
+        legend.title = element_blank(),
+        legend.position = "top") +
+  labs(y = "Performance",
+       title = "ABCD Cognitive Factors",
+       subtitle = bquote("(" * italic(N) * " = " * .(formatC(tidy_model$N[1], format = "d", big.mark = ",")) * ")"))
+
+## Build rectangles to display the minima. 
+# Add two new rows for each row where upper < lower
+rect.tibble <- abcd.factors.mins %>%
+  mutate_if(is.POSIXct, as.Date) %>%  # Convert all date-time columns to date for easier comparison
+  filter(upper < lower) %>%
+  rowwise() %>%
+  do(bind_rows(., tibble(
+    Factor = .$Factor,
+    max.y = NA,
+    lower = as.Date("2023-01-01"),
+    upper = .$upper,
+    min.y = .$min.y
+  ), tibble(
+    Factor = .$Factor,
+    max.y = NA,
+    lower = .$lower,
+    upper = as.Date("2023-12-31"),
+    min.y = .$min.y
+  ))) %>%
+  ungroup() %>%
+  rbind(abcd.factors.mins)%>%
+  filter(upper>lower)%>%
+  mutate(ymin=as.numeric(factor(Factor))-.5,ymax=ymin+1)%>%
+  mutate_if(is.Date, as.POSIXct)
+# Plot rectangles
+radial.plot <- ggplot(rect.tibble,aes(y=Factor,
+                       x=min.y,
+                       xmin=lower,
+                       xmax=upper,
+                       ymin=ymin,
+                       ymax=ymax,
+                       fill=Factor,
+                       color=Factor))+
+  geom_rect(alpha=.25,color=NA)+
+  geom_point()+
+  scale_color_brewer(type = "seq",palette = "Reds",direction = -1)+
+  scale_fill_brewer(type = "seq",palette = "Reds",direction = -1)+
+  scale_x_datetime(date_labels = "%B",
+                   limits = lubridate::parse_date_time(c("1","365"),orders="j"),
+                   date_breaks = "1 months")+
+  cowplot::theme_minimal_grid()+
+  theme(axis.text.x=element_text(hjust = 1,vjust = -2),
+        axis.title = element_blank(),
+        axis.line.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major.y = element_blank(),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        plot.title = element_text(face = "plain"))+
+  coord_polar(start = -pi/365,clip = "off")+
+  ggtitle("Day of Minimum Performance")
+
+#display the plots
+print(line.plot)
+print(radial.plot)
+#save the plots
+cowplot::save_plot('Figs/ABCD.line.plot.svg',line.plot+theme(legend.position = "none"))
+cowplot::save_plot('Figs/ABCD.radial.plot.svg',radial.plot)
+```
+
+Confirm it family id is not influencing the results (excluding siblings from the analysis).  
+
+```{r,echo=FALSE,cache=TRUE}
+siblings <- abcd.df %>% count(rel_family_id)%>%filter(n>1)%>%pull(rel_family_id) #get family ids with more than one member
+model_output <- longdf %>%
+  filter(!rel_family_id %in% siblings)%>%
+  group_by(Factor) %>%
+  summarise(model = list(bam(
+    score ~ 
+      s(age)+
+      s(weekdaynum, bs = "cc", k = 7) +
+      s(doy, bs = "cc", k = 52) +
+      s(doy, abcd_site, bs = "sz", xt = list(bs="cc",k=26)) +
+      sex,
+    method = "REML")),
+    reduced_model = list(
+      bam(
+        score ~ 
+          s(age)+
+          s(weekdaynum, bs = "cc", k = 7) +
+          s(abcd_site, bs = "re") +
+          sex,
+        method = "REML")))
+
+tidy_model <- model_output%>%
+  mutate(tidy = map(model, function(x) {
+    tidydf = broom::tidy(x)
+    tidydf$N = length(x$residuals)
+    tidydf
+  })) %>%
+  unnest(tidy)%>%
+  select(-model,-reduced_model)%>%
+  filter(str_detect(string = term,pattern = "s\\(doy\\)"))%>%
+  mutate(pfdr=p.adjust(p.value))%>%
+  relocate(N,.before = "edf")
+tidy_model%>%kableExtra::kbl(escape = F)%>%kableExtra::kable_classic(html_font = "Cambria")
+
+r2_model <- model_output%>%
+  mutate(partialr2=map2(.x=model,.y=reduced_model,.f= ~partialR2(full_mod=.x,reduced_mod=.y))) %>%
+  unnest(partialr2)%>%
+  select(-model,-reduced_model)
+r2_model%>%kableExtra::kbl(escape = F)%>%kableExtra::kable_classic(html_font = "Cambria")
+
+model_smooths <-  model_output%>%
+  select(-reduced_model)%>%
+  mutate(smooths = map(model,smooth_estimates)) %>%
+  unnest(smooths) %>%
+  select(-model)%>%
+  filter(smooth=="s(doy)")
+
+abcd_factors=model_smooths%>%
+  mutate(upper=est+1.96*se,lower=est-1.96*se)%>%
+  mutate(date_labels = lubridate::parse_date_time(as.character(floor(doy)),orders="j"))
+
+# Do this another way
+newdf <- with(abcd.df,expand_grid(age=median(age),
+                                 doy=seq(from=1,to=365,by=.2),
+                                 weekdaynum=2,
+                              sex="Male",
+                              abcd_site="site_04"))
+
+plot.data.abcd <-  model_output%>%
+  mutate(plot.df = map(.x=model,
+                       .f=~ make.plot.df(.x,term = "doy",
+                                         newdata=newdf)%>% 
+                         mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"))))%>%
+  unnest(plot.df) %>%
+  select(-model,-reduced_model)
+
+abcd.factors.mins <- model_output %>% 
+  mutate(minmax = map(.x=model,.f=~gam.posterior.smooths.circular(.x,return_draws = FALSE,smooth_var="doy"))) %>%
+  unnest(minmax)%>%
+  select(Factor,minmax)%>%
+  unnest(minmax)%>%
+  filter(is.na(max.y))%>%
+  mutate(across(.cols=where(is.numeric),.fns=~lubridate::parse_date_time(as.character(floor(.)),orders="j")))
+
+table.whole.sample.nosibs <- left_join(tidy_model,r2_model)%>%
+  select(Factor,N,edf,partialr2,p.value,pfdr)
+
+# Creating individual gt tables
+gt1 <- gt::gt(table.whole.sample.nosibs) %>% tab_header(title = "Whole Sample (No Siblings)")
+gt2 <- gt::gt(table.whole.sample) %>% tab_header(title = "Whole Sample")
+
+# Print the tables:
+gt2
+gt1
+
+write.table(table.whole.sample.nosibs,file = "ABCD_table_whole_sample_nosibs.csv",quote = F,row.names = F,sep = ",")
+
+```
+
+### Splits
+
+This code just repeats what we did for the whole sample for each individual split.  
+Fit the models, get fit stats, and make plots.  
+
+```{r,echo=FALSE,cache=TRUE}
+longdf <- abcd.df %>% 
+  filter(matched_group %in% c(1,2))%>% # only use ppts in the splits
+  filter(pc1<800) %>% #remove NAs which are represented as 888
+  pivot_longer(cols = c("pc1","pc2","pc3"),names_to = "Factor",values_to = "score")%>% #reshape data
+  mutate(Factor = factor(Factor,levels=c("pc1","pc2","pc3"),labels=c("General Cognition", "Executive Function", "Learning/Memory"))) #rename factors
+  
+
+model_output <- longdf %>%
+  group_by(matched_group,Factor) %>%
+  summarise(model = list(bam(
+    score ~ 
+      s(age)+
+      s(weekdaynum, bs = "cc", k = 7) +
+      s(doy, bs = "cc", k = 52) +
+      s(doy, abcd_site, bs = "sz", xt = list(bs="cc",k=26)) +
+      sex,
+    method = "REML")), #fit the model
+    reduced_model = list(
+      bam(
+        score ~ 
+          s(age)+
+          s(weekdaynum, bs = "cc", k = 7) +
+          s(abcd_site, bs = "re") +
+          sex,
+        method = "REML"))) #fit the reduced model
+
+tidy_model <- model_output%>% # get the model output in tidy format
+  mutate(tidy = map(model, function(x) {
+    tidydf = broom::tidy(x)
+    tidydf$N = length(x$residuals)
+    tidydf
+  })) %>%
+  unnest(tidy)%>%
+  select(-model,-reduced_model)%>%
+  filter(str_detect(string = term,pattern = "s\\(doy\\)"))%>%
+  mutate(pfdr=p.adjust(p.value))%>%
+  relocate(N,.before = "edf")
+tidy_model%>%kableExtra::kbl(escape = F,caption = "Model output for splits and factors")%>% kableExtra::kable_classic(html_font = "Cambria") #display the table
+
+# get the partial R2 values
+r2_model <- model_output%>%
+  mutate(partialr2=map2(.x=model,.y=reduced_model,.f= ~partialR2(full_mod=.x,reduced_mod=.y))) %>%
+  unnest(partialr2)%>%
+  select(-model,-reduced_model) 
+r2_model%>%kableExtra::kbl(escape = F,caption = "Model partial r-squared")%>%
+  kableExtra::kable_styling(full_width=FALSE)%>%
+  kableExtra::kable_classic(html_font = "Cambria") #display the table
+
+plot.df.abcd.splits <- model_output%>%
+  select(-reduced_model)%>%
+  mutate(plot.df = map(model,
+                       .f=~ make.plot.df(.x,term = "doy",add.intercept = FALSE)))%>% #get the plot data
+  unnest(plot.df) %>%
+  select(-model)
+
+# get the minima
+abcd.factors.mins.splits <- model_output %>% 
+  mutate(minmax = map(.x=model,.f=~gam.posterior.smooths.circular(.x,return_draws = FALSE,smooth_var="doy"))) %>% 
+  unnest(minmax)%>%
+  select(Factor,minmax)%>%
+  unnest(minmax)%>%
+  filter(is.na(max.y))%>%
+  mutate(across(.cols=where(is.numeric),.fns=~lubridate::parse_date_time(as.character(floor(.)),orders="j")))
+
+table.abcd.splits <- left_join(tidy_model,r2_model)%>%
+  select(Factor,N,edf,partialr2,p.value,pfdr)%>%
+  mutate(matched_group = as.character(matched_group)) # create a table of fit stats
+
+abcd.results <- table.whole.sample %>% 
+  mutate(matched_group = "ABCD Total")%>%
+  relocate(matched_group)%>%
+  bind_rows(table.abcd.splits%>% mutate(matched_group = paste("ABCD Split",matched_group)))%>%
+  rename(Sample:=matched_group) #combine the tables
+```
+
+#### Plot abcd factor results for each split
+
+Do the plotting for each split.  
+
+```{r,echo=FALSE, fig.height=6}
+# Build the line plot depicting the ToY effect.
+lines.split <- ggplot(plot.df.abcd.splits,aes(x=doy.raw,y=fit,color=Factor,fill=Factor,ymin=lwr,ymax=upr))+
+  geom_ribbon(alpha=.1,color=NA)+
+  geom_line()+
+  scale_color_brewer(type = "seq",palette = "Reds",direction = -1)+
+  scale_fill_brewer(type = "seq",palette = "Reds",direction = -1)+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
+  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.title = element_blank(),plot.title = element_text(face = "plain"))+
+  labs(y = "Performance",
+       title = "Split half replication")+
+  facet_wrap(~matched_group,labeller = labeller(matched_group = 
+    c("1" = "Split 1",
+      "2" = "Split 2")))+
+  theme(strip.background = element_blank(),legend.position = "none")
+
+## Build rectangles
+# Add two new rows for each row where upper < lower
+rect.tibble <- abcd.factors.mins.splits %>%
+  mutate_if(is.POSIXct, as.Date) %>%  # Convert all date-time columns to date for easier comparison
+  filter(upper < lower) %>%
+  rowwise() %>%
+  do(bind_rows(., tibble(
+    matched_group = .$matched_group,
+    Factor = .$Factor,
+    max.y = NA,
+    lower = as.Date("2024-01-01"),
+    upper = .$upper,
+    min.y = .$min.y
+  ), tibble(
+    matched_group = .$matched_group,
+    Factor = .$Factor,
+    max.y = NA,
+    lower = .$lower,
+    upper = as.Date("2024-12-31"),
+    min.y = .$min.y
+  ))) %>%
+  ungroup() %>%
+  rbind(abcd.factors.mins.splits)%>%
+  filter(upper>lower)%>%
+  mutate(ymin=as.numeric(factor(Factor))-.5,ymax=ymin+1)%>%
+  mutate_if(is.Date, as.POSIXct)
+
+# Plot rectangles
+radial.split <- ggplot(rect.tibble,aes(y=Factor,
+                       x=min.y,
+                       xmin=lower,
+                       xmax=upper,
+                       ymin=ymin,
+                       ymax=ymax,
+                       fill=Factor,
+                       color=Factor))+
+  geom_rect(alpha=.25,color=NA)+
+  geom_point()+
+  scale_color_brewer(type = "seq",palette = "Reds",direction = -1)+
+  scale_fill_brewer(type = "seq",palette = "Reds",direction = -1)+
+  scale_x_datetime(date_labels = "%B",
+                   limits = lubridate::parse_date_time(c("1","365"),orders="j"),
+                   date_breaks = "1 months")+
+  cowplot::theme_minimal_grid()+
+  theme(axis.text.x=element_text(hjust = 1,vjust = -1),
+        axis.title = element_blank(),
+        axis.line.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.spacing = unit(2, "lines"),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        plot.title = element_text(face = "plain"))+
+  coord_polar(start = -pi/365,clip = "off")+
+  ggtitle("Day of Minimum Performance")+
+  facet_wrap(~matched_group,labeller = labeller(matched_group = 
+    c("1" = "Split 1",
+      "2" = "Split 2")))
+
+cowplot::save_plot('Figs/ABCD.split.lines.svg',lines.split)
+cowplot::save_plot('Figs/ABCD.split.radial.svg',radial.split)
+
+lines.split
+radial.split
+
+```
+
+## Demographics
+### Sex
+```{r, sex, fig.height=7, fig.width=6}
+
+# Fit a GAM model to predict neurocognitive PC1 based on various covariates, including sex (osex)
+gmod.sex <- bam(neurocog_pc1.bl~
+                  s(weekdaynum, bs = "cc", k = 7)+
+                   osex+
+                  s(age, k=4)+
+                  s(doy, bs = "cc",k = 52)+
+                  s(doy, abcd_site, bs = "fs", xt = list(bs="cc"))+
+                  s(doy, osex, bs = "sz", xt = list(bs="cc")),
+                data = abcd.df,method = "REML")
+summary(gmod.sex)
+
+# Prepare data for plotting
+sex.plot.df <- make.plot.df(modobj = gmod.sex, term = "doy", int.term = "osex")%>% 
+  mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"))
+  
+# Define custom breaks for x-axis labels (dates)
+custom_breaks <- c(ymd_hms("2024-01-01 00:00:00"), 
+                   seq(from = ymd_hms("2024-04-01 00:00:00"), 
+                       to = ymd_hms("2024-12-01 00:00:00"), 
+                       by = "3 months"),
+                   ymd_hms("2024-12-31 00:00:00"))
+
+# Plot the fitted values with confidence ribbons and line
+gplot <- ggplot(sex.plot.df,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr,color=osex.raw,fill=osex.raw))+
+  geom_ribbon(alpha=.25,color=NA)+
+  geom_line(size=1.5)+ 
+  scale_x_continuous(breaks = seq(1, 365, by = 120), 
+    labels = function(doy) sapply(doy, doy_to_month)) +
+  scale_color_brewer(type = "qual",aesthetics = c("fill","color"))+
+  theme(axis.text.x=element_blank(),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top",legend.title = element_blank())+
+  ylab("General Cognition")+
+  ylim(-.8,.75)
+gplot
+
+
+# Boxplot of sex differences in day of year (doy) distribution
+rplot2<-ggplot(gmod.sex$model,
+       aes(y=doy,x=osex,color=osex,fill=osex))+
+  ggdist::stat_halfeye(adjust = .5, width = .7, .width = 0, justification = -.2,point_colour=NA) +
+  scale_y_continuous(breaks = seq(1, 365, by = 120),  
+    labels = function(doy) sapply(doy, doy_to_month)) +
+  scale_color_brewer(type = "qual",aesthetics = c("fill","color"))+
+  coord_flip()+
+  geom_boxplot(width=.15,fill=NA)+
+  theme(legend.position="none",legend.title = element_blank(),axis.title=element_blank(),axis.text.x = element_text(angle=60,hjust=1,vjust=1),axis.text.y=element_blank(),axis.ticks.y = element_blank())
+
+# Combine and display the plots
+combined2 <- gplot/rplot2 + plot_layout(heights = c(2, 1.5))
+combined2
+
+# Save the combined plot
+cowplot::save_plot('./Figs/Demographics.sex2.svg',combined2,base_height = 5, base_width = 3.3)
+
+```
+
+
+### Education
+```{r, educ, fig.height=7,fig.width=4}
+# Relevel education variable for analysis (Some College as the reference group)
+abcd.df$oeduc <- ordered(relevel(abcd.df$high.educ,ref = "Some College"))
+
+# Fit a GAM model to predict neurocognitive PC1 based on education level, sex, age, etc.
+gmod.educ <- bam(neurocog_pc1.bl~
+                   s(weekdaynum, bs = "cc", k = 7)+
+                   s(age, k=4)+
+                   s(doy, bs = "cc",k = 52)+
+                   s(doy, abcd_site, bs = "fs", xt = list(bs="cc"))+
+                   osex+
+                   oeduc+
+                   s(doy,oeduc, bs = "sz", xt = list(bs="cc",k=52)),
+                 method = "REML",
+                 data = abcd.df)
+summary(gmod.educ)
+
+# Prepare data for plotting education effects on neurocognitive scores over the calendar year
+educ.plot.df <- make.plot.df(gmod.educ,term = "doy", int.term = "oeduc") %>% 
+  mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"))%>%
+  mutate(fac.educ = relevel(factor(oeduc.raw,levels=levels(abcd.df$high.educ),ordered = FALSE),ref="< HS Diploma"))
+
+# Plot the fitted values for education groups over the year
+gplot <- ggplot(educ.plot.df,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr,color=fac.educ,fill=fac.educ))+
+  geom_ribbon(alpha=.25,color=NA)+
+  geom_line(size=1.5)+ 
+  scale_color_brewer(type = "qual",aesthetics = c("fill","color"))+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), 
+                     labels = function(doy.raw) sapply(doy.raw, doy_to_month)) +
+  theme(axis.title.x = element_blank(), axis.text.x =  element_blank(),legend.position = "top",legend.title.position = "top",legend.title = element_blank())+
+  guides(color=guide_legend(nrow=2, byrow=TRUE),fill=guide_legend(nrow=2, byrow=TRUE)) +
+  ylab("General Cognition")+ylim(-.8,.75)
+
+# Raincloud plot showing education groups' distribution across the year
+rplot<-ggplot(gmod.educ$model%>%
+         mutate(fac.educ=factor(oeduc,levels=levels(educ.plot.df$fac.educ))),
+       aes(y=doy,x=fac.educ,color=fac.educ,fill=fac.educ))+
+  ggdist::stat_halfeye(adjust = .5, width = .7, .width = 0, justification = -.2,point_colour=NA) +
+  scale_y_continuous(breaks = seq(1, 365, by = 120),  
+    labels = function(doy) sapply(doy, doy_to_month)) +
+  scale_color_brewer(type = "qual",aesthetics = c("fill","color"))+
+  coord_flip()+
+  geom_boxplot(width=.15,fill=NA)+
+  theme(legend.position="none",legend.title = element_blank(),axis.title=element_blank(),axis.text.x = element_text(angle=60,hjust=1,vjust=1),axis.text.y=element_blank(),axis.ticks.y = element_blank())
+
+# Combine and display the plots
+combined <- gplot/rplot + plot_layout(heights = c(2, 1.5))
+combined
+cowplot::save_plot('./Figs/Demographics.educ.svg',combined,base_height = 5, base_width = 3.3)
+
+```
+
+### Income
+```{r, income}
+# Relevel household income variable for analysis
+abcd.df$household.income <- relevel(abcd.df$household.income,ref = "[missing]")
+
+# Fit a GAM model to predict neurocognitive PC1 based on household income, sex, and other covariates
+gmod.inc <- bam(neurocog_pc1.bl~
+                  s(weekdaynum, bs = "cc", k = 7)+
+                  s(age, k=4)+
+                  s(doy, bs = "cc",k = 52)+
+                  s(doy, abcd_site, bs = "fs", xt = list(bs="cc"))+
+                  s(doy, household.income, bs = "sz", xt = list(bs="cc")),
+                data = abcd.df,method = "REML")
+summary(gmod.inc)
+
+# Prepare data for plotting income effects on neurocognitive scores over the year
+inc.plot.df <- make.plot.df(gmod.inc,term = "doy", int.term = "household.income") %>% 
+  mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"))%>%
+  mutate(fac.inc = relevel(factor(household.income),ref="missing"))
+
+# Plot the fitted values for income groups over the year
+gplot <- ggplot(inc.plot.df,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr,color=fac.inc,fill=fac.inc))+
+  geom_ribbon(alpha=.25,color=NA)+
+  geom_line(size=1.5)+ 
+  scale_color_brewer(type = "qual",aesthetics = c("fill","color"))+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), 
+    labels = function(doy.raw) sapply(doy.raw, doy_to_month)) +
+  theme(axis.title.x = element_blank(), axis.text.x =  element_blank(),legend.position = "top",legend.title.position = "top",legend.title = element_blank())+
+  guides(color=guide_legend(nrow=2, byrow=TRUE),fill=guide_legend(nrow=2, byrow=TRUE)) +
+  ylab("General Cognition")+ylim(-.8,.75)
+gplot
+
+# Raincloud plot showing income groups' distribution across the year
+rplot<-ggplot(gmod.inc$model%>%
+         mutate(fac.inc=factor(household.income,levels=levels(inc.plot.df$fac.inc))),
+       aes(y=doy,x=fac.inc,color=fac.inc,fill=fac.inc))+
+  ggdist::stat_halfeye(adjust = .5, width = .7, .width = 0, justification = -.2,point_colour=NA) +
+  scale_y_continuous(breaks = seq(1, 365, by = 120),  
+    labels = function(doy) sapply(doy, doy_to_month)) +
+  scale_color_brewer(type = "qual",aesthetics = c("fill","color"))+
+  coord_flip()+
+  geom_boxplot(width=.15,fill=NA)+
+  theme(legend.position="none",legend.title = element_blank(),axis.title = element_blank(),axis.text.x = element_text(angle=60,hjust=1,vjust=1),axis.text.y=element_blank(),axis.ticks.y = element_blank())
+
+# Combine and display the plots
+combined <- gplot/rplot + plot_layout(heights = c(2, 1.5))
+combined
+cowplot::save_plot('./Figs/Demographics.inc.svg',combined,base_height = 5, base_width = 3.3)
+
+```
+
+### Race
+```{r, race}
+abcd.df$orace.4level <- ordered(abcd.df$race.4level)
+gmod.race <- bam(neurocog_pc1.bl~
+                   s(weekdaynum, bs = "cc", k = 7)+
+                   s(age, k=4)+
+                   s(doy, bs = "cc",k = 52)+
+                   s(doy, abcd_site, bs = "fs", xt = list(bs="cc"))+
+                   osex+
+                   orace.4level +
+                   s(doy, orace.4level, bs = "sz", xt = list(bs="cc",k=52)),
+                 method = "REML",
+                 data = abcd.df)
+summary(gmod.race)
+
+race.plot.df <- make.plot.df(modobj = gmod.race, term = "doy",int.term = "orace.4level") %>% mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"))%>%
+  mutate(fac.race = factor(orace.4level.raw,levels=levels(abcd.df$race.4level)))
+
+gplot <- ggplot(race.plot.df,aes(x=doy.raw,
+                                 y=fit,
+                                 ymin=lwr,
+                                 ymax=upr,
+                                 color=fac.race,
+                                 fill=fac.race))+
+  geom_ribbon(alpha=.25,color=NA)+
+  geom_line(size=1.5)+ 
+  scale_color_brewer(type = "qual",aesthetics = c("fill","color"))+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
+  theme(axis.text.x=element_blank(),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top",legend.title = element_blank())+
+  ylab("General Cognition")+ylim(-.8,.8)
+
+rplot<-ggplot(gmod.race$model%>%mutate(fac.race = factor(orace.4level,levels=levels(abcd.df$race.4level))),aes(y=doy,x=fac.race,color=fac.race,fill=fac.race))+
+  ggdist::stat_halfeye(adjust = .5, width = .7, .width = 0, justification = -.2,point_colour=NA) +
+  # ggdist::stat_dots(side = "left", dotsize = .6, justification = 1.28, binwidth = NA)+
+  scale_y_continuous(breaks = seq(1, 365, by = 120),  # Adjust the interval as needed
+    labels = function(doy) sapply(doy, doy_to_month)) +
+  scale_color_brewer(type = "qual",aesthetics = c("fill","color"))+
+  coord_flip()+
+  geom_boxplot(width=.15,fill=NA)+
+  theme(legend.position="none",legend.title = element_blank(),axis.title=element_blank(),axis.text.x = element_text(angle=60,hjust=1,vjust=1),axis.text.y=element_blank(),axis.ticks.y = element_blank())
+combined <- gplot/rplot + plot_layout(heights = c(2, 1.5))
+combined
+cowplot::save_plot('./Figs/Demographics.race.svg',combined, base_height = 5, base_width = 3.3)
+```
+
+## Comparing the magnitude of day-of-year and age effects. 
+
+```{r magnitude of effect}
+# Function to get a CI of predicted values
+get_fit_samples <- function(gam.model, newdata) {
+  npd <- 1000  # Number of posterior draws
+  
+  # Estimate posterior smooth functions (fitted values) from simulated GAM posterior distribution
+  # Each posterior draw includes uncertainty in estimated model coefficients (intercept, covariates, and splines)
+  # Similar to fitted_samples from gratia
+  
+  # Extract variance-covariance matrix for all fitted model parameters
+  Vb <- vcov(gam.model, unconditional = TRUE) 
+  
+  # Simulate model coefficients from the posterior distribution
+  sims <- MASS::mvrnorm(npd, mu = coef(gam.model), Sigma = Vb) 
+  
+  # Get matrix of linear predictors (mapping model parameters to smooth fit)
+  X0 <- predict(gam.model, newdata = newdata, type = "lpmatrix") 
+  
+  # Get column indices for terms of interest
+  term_labels <- attr(X0, "dimnames")[[2]]
+  s_doy_cols <- grep("s\\(doy\\)", term_labels)
+  s_age_cols <- grep("s\\(age\\)", term_labels)
+  s_tidoyage_cols <- grep("ti\\(age,doy\\)", term_labels)
+  
+  # Zero out all columns except for those corresponding to terms of interest (s(doy), s(age), ti(age, doy))
+  X0_terms <- X0
+  X0_terms[, -c(s_doy_cols, s_age_cols, s_tidoyage_cols)] <- 0
+  
+  # Generate posterior smooths (fitted values for each set of posterior draw model parameters)
+  predicted_smooth_values <- X0_terms %*% t(sims)
+  
+  # Label the draws
+  colnames(predicted_smooth_values) <- sprintf("draw%s", seq(from = 1, to = npd))
+  
+  # Combine predicted smooth values with the original newdata
+  predicted_smooth_values <- newdata %>% bind_cols(predicted_smooth_values)
+  
+  # Calculate relative changes and confidence intervals
+  relative_changes <- predicted_smooth_values %>% 
+    pivot_longer(cols = contains("draw"), names_to = "draw", values_to = "fitted") %>%
+    group_by(draw) %>%
+    summarize(
+      age_change = (max(fitted[doy == doy[1]]) - min(fitted[doy == doy[1]])) / ((max(age) - min(age)) / 365.25),
+      doy_change = (max(fitted[age == age[1]]) - min(fitted[age == age[1]])),
+      proportion_change = doy_change / age_change
+    ) %>%
+    ungroup() %>%
+    summarize(
+      mean_proportion_change = mean(proportion_change),
+      ci_low = quantile(proportion_change, probs = c(0.025)),
+      ci_high = quantile(proportion_change, probs = c(0.975))
+    )
+  
+  return(relative_changes)
+}
+
+# Reshape the data to long format to prepare for analysis
+# Here, we focus on columns that contain "neurocog_pc" for factor-based comparisons.
+longdf <- abcd.df %>% 
+  pivot_longer(cols = contains("neurocog_pc"), names_to = "Factor", values_to = "score")
+
+# Fit GAM models for each factor in the reshaped data
+# Each model will use a smooth term for age, weekday number, and day of year (doy) 
+# to capture seasonal patterns and age-related trends in neurocognitive scores.
+model_output <- longdf %>%
+  group_by(Factor) %>%
+  summarise(
+    model = list(
+      bam(score ~ 
+            s(age, k = 4) +                              # Smooth effect of age
+            s(weekdaynum, bs = "cc", k = 7) +            # Cyclic smooth effect of weekday
+            s(doy, abcd_site, bs = "sz", xt = list(bs = "cc", k = 26)) + # Site-specific smooths for day of year
+            osex +                                       # Effect of sex
+            s(doy, bs = "cc", k = 52),                   # Overall smooth effect of day of year
+          method = "REML")
+    )
+  )
+
+# Create a new dataset for predictions across a subset of values
+# This dataset spans a range of doy and age values, holding other variables constant.
+newdata <- with(model_output$model[[1]]$model, expand.grid(
+  doy = 120:270,                        # Range of summer DOY
+  age = seq(from = min(age), to = max(age), by = 30),  # Range of ages
+  osex = "Male",                        # Hold sex constant
+  weekdaynum = median(weekdaynum),      # Use median weekday value
+  abcd_site = "site06"                  # Set to one site for consistency
+))
+
+# Generate fitted values for the first model as a preview (for checks)
+fv <- fitted_values(model_output$model[[1]], data = newdata)
+
+# Obtain fitted values for each model, then unnest to add predictions to data
+# These fitted values represent model-predicted scores for the specified combinations of age and DOY.
+fv_model <- model_output %>%
+  mutate(fv = map(model, fitted_values, data = newdata)) %>%
+  unnest(fv) %>%
+  select(-model)
+
+# Visualize the relationship between age and fitted values by DOY for each factor
+# This plot helps assess how predicted scores vary across age and season.
+ggplot(fv_model, aes(color = doy, y = fitted, x = age)) + 
+  geom_point() + 
+  facet_wrap(~Factor)
+
+# Visualize fitted values by DOY across age groups for each factor
+# This allows us to examine seasonal trends and how they interact with age.
+ggplot(fv_model, aes(x = doy, y = fitted, color = age)) + 
+  geom_point() + 
+  facet_wrap(~Factor)
+
+# Compute yearly change proportion for summer months (comparison of age effect vs. summer effect)
+# This function estimates how much of the yearly age effect is represented by the summer period alone.
+fs_model <- model_output %>%
+  mutate(fs = map(model, get_fit_samples, newdata = newdata)) %>%
+  unnest(fs) %>%
+  select(-model)
+
+# Print the proportion of yearly age effect represented by the summer months
+# We format the output to clearly state the result for each factor.
+fs_model %>%
+  mutate(message = sprintf(
+    "Proportion of yearly age effect for summer months %s = %1.2f [%1.2f, %1.2f]",
+    Factor, mean_proportion_change, ci_low, ci_high
+  )) %>%
+  pull(message) %>%
+  walk(~ cat(.x, "\n"))
+
+# Derivative analysis to compare slopes for age and doy terms
+# This calculates the derivative (rate of change) for the smooth effects of age and DOY,
+# allowing a comparison of the maximum age-related slope to the summer-related slope.
+d_model <- model_output %>%
+  mutate(d = map(model, derivatives, data = newdata, term = c('s(doy)', 's(age)'))) %>%
+  unnest(d) %>%
+  select(-model) %>%
+  group_by(Factor, smooth) %>%
+  summarize(maxslope = max(derivative), minslope = min(derivative))
+
+# Print a summary statement of the slope comparison for each factor
+# This communicates the relative strength of the age slope vs. summer slope.
+d_model %>%
+  ungroup() %>%
+  group_by(Factor) %>%
+  mutate(message = sprintf(
+    "Kids lose %1.2f days of development in %s for each day of summer",
+    abs(minslope[smooth == "s(doy)"] / maxslope[smooth == "s(age)"]),
+    Factor
+  )) %>%
+  distinct(message) %>%
+  pull(message) %>%
+  walk(~ cat(.x, '\n'))
+
+# Compute partial R2 for age to measure its effect size in the model
+# Here, we calculate the partial R2 for the age effect, which isolates its contribution.
+model_output <- longdf %>%
+  group_by(Factor) %>%
+  summarise(
+    model = list(bam(score ~ 
+                       s(age) + 
+                       s(weekdaynum, bs = "cc", k = 7) + 
+                       s(doy, bs = "cc", k = 52) + 
+                       s(doy, abcd_site, bs = "fs", xt = list(bs = "cc", k = 26)) + 
+                       sex, method = "REML")),
+    reduced_model = list(bam(score ~ 
+                               s(weekdaynum, bs = "cc", k = 7) + 
+                               s(doy, bs = "cc", k = 52) + 
+                               s(doy, abcd_site, bs = "fs", xt = list(bs = "cc", k = 26)) + 
+                               sex, method = "REML"))
+  )
+
+# Calculate partial R2 for age by comparing full and reduced models
+# Partial R2 captures the variance in the response explained by age after accounting for other variables.
+r2_model <- model_output %>%
+  mutate(partialr2 = map2(model, reduced_model, partialR2)) %>%
+  unnest(partialr2) %>%
+  select(-model, -reduced_model)
+```
+
+### Repeat while covarying for exposome
+
+```{r}
+# Reshape data to prepare for factor-based comparisons in neurocognitive scores
+longdf <- abcd.df %>% 
+  pivot_longer(cols = contains("neurocog_pc"), names_to = "Factor", values_to = "score")
+
+# Fit Generalized Additive Models (GAMs) for each neurocognitive factor
+# The model includes smooth terms for age, weekday, general SES, day of year (doy) with site-specific effects, and sex.
+model_output <- longdf %>%
+  group_by(Factor) %>%
+  summarise(
+    model = list(
+      bam(score ~ 
+            s(age, k = 4) +                          # Smooth effect for age
+            s(weekdaynum, bs = "cc", k = 7) +        # Cyclic smooth for weekday
+            s(General_SES) +                         # Smooth for general SES effect
+            s(doy, abcd_site, bs = "sz", xt = list(bs = "cc", k = 26)) + # Day-of-year smooth, varying by site
+            osex +                                   # Effect of sex
+            s(doy, bs = "cc", k = 52),               # Overall smooth effect for day of year
+          method = "REML")
+    )
+  )
+
+# Generate prediction data across a range of values
+# Prediction data spans doy and age values, with constants for other variables
+newdata <- with(model_output$model[[1]]$model, expand.grid(
+  doy = 120:270,                            # Range of summer days
+  age = seq(from = min(age), to = max(age), by = 30),  # Range of ages
+  osex = "Male",                            # Hold sex constant for predictions
+  weekdaynum = median(weekdaynum),          # Set weekday number to median
+  abcd_site = "site06",                     # Use one site for consistency
+  General_SES = median(General_SES)         # Set general SES to median
+))
+
+# Compute fitted values from the first model as a preview
+fv <- fitted_values(model_output$model[[1]], data = newdata)
+
+# Extract fitted values from each model and add to the data for visualization
+# These values reflect the predicted scores for age and day of year combinations.
+fv_model <- model_output %>%
+  mutate(fv = map(model, fitted_values, data = newdata)) %>%
+  unnest(fv) %>%
+  select(-model)
+
+# Plot fitted values against age and doy to observe trends
+# These visualizations display how predicted neurocognitive scores change across age and seasonal effects.
+ggplot(fv_model, aes(color = doy, y = fitted, x = age)) + 
+  geom_point() + 
+  facet_wrap(~Factor)
+ggplot(fv_model, aes(x = doy, y = fitted, color = age)) + 
+  geom_point() + 
+  facet_wrap(~Factor)
+
+# Generate partial effect plots to isolate the effects of doy and age
+# The `predict = "terms"` option helps in visualizing specific term effects.
+doy_fit <- make.plot.df(model_output$model[[1]], term = "doy") %>%
+  filter(doy.raw >= 122 & doy.raw < 281)  # Focus on summer days
+age_fit <- make.plot.df(model_output$model[[1]], term = "age")
+ggplot(doy_fit, aes(x = doy.raw, y = fit)) + geom_line()
+ggplot(age_fit, aes(x = age.raw, y = fit)) + geom_line()
+
+# Calculate the proportion of yearly age effect represented by summer months
+# This approach estimates the total age effect and the amount of change specifically over summer.
+fs_model <- model_output %>%
+  mutate(fs = map(model, get_fit_samples, newdata = newdata)) %>%
+  unnest(fs) %>%
+  select(-model)
+
+# Print the proportion of yearly age effect covered by the summer period for each factor
+fs_model %>%
+  mutate(message = sprintf(
+    "Proportion of yearly age effect for %s = %1.2f [%1.2f, %1.2f]",
+    Factor, mean_proportion_change, ci_low, ci_high
+  )) %>%
+  pull(message) %>%
+  walk(~ cat(.x, "\n"))
+
+# Derivative analysis to compare the rate of change in age vs. day of year
+# Computes the max slope for age and the most negative slope for doy for each factor.
+d_model <- model_output %>%
+  mutate(d = map(model, derivatives, data = newdata, term = c('s(doy)', 's(age)'))) %>%
+  unnest(d) %>%
+  select(-model) %>%
+  group_by(Factor, smooth) %>%
+  summarize(maxslope = max(derivative), minslope = min(derivative))
+
+# Print slope comparison message for each factor
+# The message conveys the impact of summer in terms of developmental "days lost."
+d_model %>%
+  ungroup() %>%
+  group_by(Factor) %>%
+  mutate(message = sprintf(
+    "Kids lose %1.2f days of development in %s for each day of summer",
+    abs(minslope[smooth == "s(doy)"] / maxslope[smooth == "s(age)"]),
+    Factor
+  )) %>%
+  distinct(message) %>%
+  pull(message) %>%
+  walk(~ cat(.x, '\n'))
+
+# Calculate partial R2 for age's effect on each factor
+# This section compares a full model (including age) to a reduced model without age to assess the age effect size.
+model_output <- longdf %>%
+  group_by(Factor) %>%
+  summarise(
+    model = list(bam(
+      score ~ 
+        s(age, k = 4) + 
+        ohousehold.income +                      # Adjusted income variable included in model
+        s(weekdaynum, bs = "cc", k = 7) + 
+        s(doy, bs = "cc", k = 52) + 
+        s(doy, abcd_site, bs = "fs", xt = list(bs = "cc", k = 26)) + 
+        sex,
+      method = "REML"
+    )),
+    reduced_model = list(bam(
+      score ~ 
+        s(weekdaynum, bs = "cc", k = 7, sp = model[[1]]$sp['s(weekdaynum)']) +
+        s(age, k = 4, sp = model[[1]]$sp['s(age)']) +
+        s(doy, bs = "cc", k = 52, sp = model[[1]]$sp['s(doy)']) +
+        s(doy, abcd_site, bs = "fs", xt = list(bs = "cc", k = 26)) +
+        sex,
+      method = "REML"
+    ))
+  )
+
+# Calculate partial R2 to capture the isolated effect of age on the response variable
+r2_model.income <- model_output %>%
+  mutate(partialr2 = map2(.x = model, .y = reduced_model, .f = ~partialR2(full_mod = .x, reduced_mod = .y))) %>%
+  unnest(partialr2) %>%
+  select(-model, -reduced_model)
+
+```
+
+## Site effects
+Extract model predicted minima for each ABCD site and plot them.  
+
+```{r}
+longdf <- abcd.df %>% filter(session_id == "ses-baselineyear1arm1")%>% pivot_longer(cols = contains("neurocog_pc"),names_to = "Factor",values_to = "score")
+
+model_output2 <- longdf %>%
+  group_by(Factor) %>%
+  summarise(model = list(bam(
+    score ~ 
+      s(age)+
+      s(weekdaynum, bs = "cc", k = 7) +
+      # s(doy, bs = "cc", k = 52) +
+      s(doy, abcd_site, bs = "fs", xt = list(bs="cc",k=52)) +
+      sex,
+    method = "REML"))) # fit a model for each factor
+
+model_smooths2 <-  model_output2%>%
+  mutate(smooths = map(model,smooth_estimates)) %>%
+  unnest(smooths) %>%
+  select(-model)%>%
+  filter(smooth=="s(doy,abcd_site)")
+
+abcd_factors2=model_smooths2%>%
+  mutate(upper=est+1.96*se,lower=est-1.96*se)%>%
+  mutate(date_labels = lubridate::parse_date_time(as.character(floor(doy)),orders="j"))
+
+ggplot(abcd_factors2, aes(x = doy, y = est, ymin = lower, ymax = upper, color = Factor, fill = Factor)) +
+  geom_ribbon(alpha=.23,color=NA) +
+  geom_line() +
+  facet_wrap(~abcd_site, scales = "free")
+
+abcd.site.factors.mins2 <- abcd_factors2 %>% group_by(Factor,abcd_site)%>%
+  summarize(min.day = doy[which.min(est)])%>%
+  mutate(Factor_names = factor(Factor,
+                               levels = c("neurocog_pc1.bl",
+                                          "neurocog_pc2.bl",
+                                          "neurocog_pc3.bl"), 
+                               labels = c("General Cognition", "Executive Function", "Learning/Memory")))%>%
+  mutate(date_labels = lubridate::parse_date_time(as.character(floor(min.day)),orders="j"))
+
+
+ggplot(abcd.site.factors.mins2, aes(x=Factor_names,y=date_labels, color=Factor_names,fill = Factor_names)) + 
+  geom_boxplot(width = 1, outlier.shape = NA,color="black") +
+  scale_y_datetime(date_labels = "%B",limits = lubridate::parse_date_time(c(1,365),orders = "j"))+
+  scale_x_discrete(expand = expansion(mult = c(0.02, 0.02))) +
+  coord_flip()+
+  guides(fill = 'none', color = 'none')+
+  theme(axis.title = element_blank())+
+  ggtitle("Minumum performance across all sites")
+
+site.rainclouds <- ggplot(abcd.site.factors.mins2, aes(x=Factor_names, y=min.day, fill=Factor_names, color = Factor_names)) + 
+  ggrain::geom_rain(alpha = .6,
+            boxplot.args = list(color = "black", outlier.shape = NA))+
+  scale_y_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
+  coord_flip()+
+  guides(fill = 'none', color = 'none')+
+  theme(axis.title = element_blank())+
+  ggtitle("Minumum performance across all sites")
+site.rainclouds
+cowplot::save_plot("Figs/ABCD.sites.raincloud.svg",site.rainclouds)
+
+newdf<-bind_rows(abcd_site_factors,abcd_factors2)
+ggplot(newdf,aes(x=doy,y=est,color = smooth))+geom_line() + facet_wrap(~abcd_site+Factor,scales = "free")+theme(axis.text = element_blank())
+
+ remove(abcd_site_factors)
+```
+
+
+## All abcd tasks
+
+Just repeating for every task. This is a supplementary analysis.  
+
+```{r, eval=TRUE}
+longdf <- abcd.df %>% pivot_longer(cols = contains("uncorrected"),names_to = "cogtest",values_to = "score") %>%
+  mutate(matched_group=factor(matched_group),
+         cogtest = str_remove(string=cogtest,pattern = "_uncorrected"),
+         cogtest = str_replace(string=cogtest,pattern = "_",replacement = " "))
+
+
+
+model_output <- longdf %>%
+  group_by(cogtest) %>%
+  summarise(model = list(bam(score ~ s(age,k=4)+
+                               s(weekdaynum, bs = "cc", k = 7)+
+                               sex +
+                               s(doy, bs = "cc", k = 52) +
+                               s(doy, abcd_site, bs = "sz", xt = list(bs="cc",k=26)),
+                             method = "REML")),
+            reduced_model = list({fullmod = bam(score ~ s(age,k=4)+
+                                                  s(weekdaynum, bs = "cc", k = 7)+
+                                                  sex +
+                                                  s(doy, bs = "cc", k = 52) +
+                                                  s(doy, abcd_site, bs = "sz", xt = list(bs="cc",k=26)),
+                                                method = "REML")
+            bam(score ~ s(weekdaynum, bs = "cc", k = 7, sp = fullmod$sp['s(weekdaynum)'])+
+                  s(age,k=4, sp = fullmod$sp['s(age)'])+
+                  s(abcd_site, bs = "re")+
+                  sex)}))
+
+tidy_model <- model_output %>%
+  mutate(tidy = map(model, function(x) {
+    tidydf = broom::tidy(x)
+    tidydf$N = length(x$residuals)
+    tidydf
+  })) %>%
+  unnest(tidy) %>%
+  select(-model,-reduced_model) %>%
+  filter(str_detect(term,"s\\(doy\\)"))%>%
+  # arrange(matched_group,p.value)%>%
+  # group_by(matched_group)%>%
+  mutate(pfdr=p.adjust(p.value))%>%
+  relocate(N,.before = "edf")
+
+tidy_model%>%kableExtra::kbl(escape = F)%>%kableExtra::kable_classic(html_font = "Cambria")
+
+model_smooths <-  model_output%>%
+  mutate(smooths = map(model,smooth_estimates)) %>%
+  unnest(smooths) %>%
+  select(-model,-reduced_model)%>%
+  filter(smooth=="s(doy)")
+
+r2_model <- model_output%>%
+  mutate(partialr2=map2(.x=model,.y=reduced_model,.f= ~partialR2(full_mod=.x,reduced_mod=.y))) %>%
+  unnest(partialr2)%>%
+  select(-model,-reduced_model)
+
+abcd_tasks=model_smooths%>%
+  mutate(upper=est+1.96*se,lower=est-1.96*se)%>%
+  mutate(date_labels = lubridate::parse_date_time(as.character(floor(doy)),orders="j"))
+
+abcd.tasks.mins <- model_output %>% 
+  mutate(minmax = map(.x=model,.f=~gam.posterior.smooths.circular(.x,return_draws = FALSE,smooth_var="doy"))) %>%
+  unnest(minmax)%>%
+  select(cogtest,minmax)%>%
+  unnest(minmax)%>%
+  filter(is.na(max.y))%>%
+  mutate(across(.cols=where(is.numeric),.fns=~lubridate::parse_date_time(as.character(floor(.)),orders="j")))
+
+table.whole.sample.tasks <- left_join(tidy_model,r2_model)%>%
+  select(cogtest,N,edf,partialr2,p.value,pfdr)%>%
+  arrange(-partialr2)
+write.table(table.whole.sample.tasks,file = "Tables/Sup.Table.ABCD.tasks.table.csv",quote = F,row.names = F,sep = ",")
+
+```
+
+#### Plot abcd task results
+
+Supplementary figure showing the results of the ABCD tasks. 
+
+```{r,eval=TRUE,fig.height=8}
+abcd.tasks.lines <- ggplot(abcd_tasks,
+  aes(x=doy,y=est,color=cogtest,fill=cogtest,ymin=lower,ymax=upper))+
+  geom_ribbon(alpha=.1,color=NA)+
+  geom_line()+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
+  # scale_color_viridis_d(aesthetics = c("fill","color"),option = "inferno")+
+  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.title = element_blank(),
+        plot.title = element_text(face = "plain"),strip.background = element_blank())+
+  ggtitle("ABCD NIH Toolbox")+ylab("Performance (zero-centered)")
+  # facet_wrap(~matched_group,labeller = labeller(matched_group = 
+    # c("1" = "Split 1",
+    #   "2" = "Split 2")))
+
+## Build rectangles
+# Add two new rows for each row where upper < lower
+rect.tibble <- abcd.tasks.mins %>%
+  mutate_if(is.POSIXct, as.Date) %>%  # Convert all date-time columns to date for easier comparison
+  filter(upper < lower) %>%
+  rowwise() %>%
+  do(bind_rows(., tibble(
+    cogtest = .$cogtest,
+    matched_group = .$matched_group,
+    max.y = NA,
+    lower = as.Date("2024-01-01"),
+    upper = .$upper,
+    min.y = .$min.y
+  ), tibble(
+    cogtest = .$cogtest,
+    matched_group = .$matched_group,
+    max.y = NA,
+    lower = .$lower,
+    upper = as.Date("2024-12-31"),
+    min.y = .$min.y
+  ))) %>%
+  ungroup() %>%
+  rbind(abcd.tasks.mins)%>%
+  filter(upper>lower)%>%
+  mutate(ymin=as.numeric(factor(cogtest))-.5,ymax=ymin+1)%>%
+  mutate_if(is.Date, as.POSIXct)
+
+# Plot rectangles
+ABCD.tasks.radial <- ggplot(rect.tibble,aes(y=cogtest,
+                       x=min.y,
+                       xmin=lower,
+                       xmax=upper,
+                       ymin=ymin,
+                       ymax=ymax,
+                       fill=cogtest,
+                       color=cogtest))+
+  geom_rect(alpha=.25,color=NA)+
+  geom_point()+
+  # scale_color_brewer(type = "qual")+
+  # scale_fill_brewer(type = "qual")+
+  scale_x_datetime(date_labels = "%B",limits = lubridate::parse_date_time(c("1","365"),orders="j"),date_breaks = "1 month")+
+  cowplot::theme_minimal_grid()+
+  theme(axis.text.x=element_text(hjust = 1,vjust = -1),
+        axis.title = element_blank(),
+        axis.line.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.spacing = unit(2,"lines"),
+        legend.position = "off",
+        legend.title = element_blank(),
+        plot.title = element_text(face = "plain"))+
+  coord_polar(start = -pi/365,clip = "off")+
+  ggtitle("Day of Minimum Performance")
+  # facet_wrap(~matched_group,labeller = labeller(matched_group = 
+  #   c("1" = "Split 1",
+  #     "2" = "Split 2")))
+
+
+abcd.tasks.fig <- abcd.tasks.lines/ABCD.tasks.radial
+abcd.tasks.fig
+cowplot::save_plot('Figs/ABCD.tasks.radial.svg',ABCD.tasks.radial)
+cowplot::save_plot('Figs/ABCD.tasks.lines.svg',abcd.tasks.lines,base_width = 8)
+```
+
+# PNC
+
+Analyses for the PNC data.  
+The difference between this analysis and the ABCD analysis is that we included an age*ToY interaction to allow the ToY effect to vary across the age range.  
+
+```{r data}
+task_data_ar <- fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/PNC/go1_go2_go3_pnc_cnb_zscores_frar_20170202_wdates.csv')
+task_data_nr <- fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/PNC/n9498_cnb_zscores_fr_20170202.csv')
+task_data_factor <- fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/PNC/n9498_cnb_factor_scores_fr_20170202.csv')
+demos <- fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/PNC/n9498_demographics_go1_20161212.csv')
+pnc.exposome <- fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/PNC/PNC_exposome_bifactor_expandedENV.csv')%>%
+  mutate(bblid=ID)
+
+task_data <- left_join(task_data_factor,task_data_nr)%>%
+  left_join(task_data_ar)%>%
+  left_join(demos)%>%
+  left_join(pnc.exposome)
+# mutate variables 
+pnc <- task_data%>%
+  mutate(int_date=as.Date(cnbDate,format = "%m/%d/%Y"))%>%
+  mutate(weekday = weekdays(int_date))%>%
+  mutate(doy = yday(int_date))%>%
+  mutate(monthnum=month(int_date))%>%
+  mutate(age = as.numeric(cnbAgeMonths))%>%
+  mutate(sex=factor(sex,levels=c(1,2),labels=c("M","F")),osex=ordered(sex))%>%
+  mutate(subid=factor(bblid))%>%
+  mutate(race.factor=factor(race, levels = 1:6,labels=levels(abcd.df$race.6level)))%>%
+  left_join(weekdaykey)%>%
+  filter(!is.na(NAR_Overall_Accuracy)&!is.na(age))
+setDT(pnc)
+```
+
+## All PNC factors
+
+We fit the interaction model for doy and age for all factors and extract model fit stats.  
+
+```{r pncfactors}
+# Preparing the data for each factor by pivoting the long format for efficiency scores 
+# and including necessary variables (weekday number, day of year, sex, age)
+pnc.long <- pnc %>% select(weekdaynum,doy,osex,age,contains("Effic"))%>%
+                             pivot_longer(cols = contains("Effici"),names_to = "Factor",values_to = "Score") 
+
+# Fit separate GAM models for each factor to predict efficiency scores over the year
+# The full model includes smooth terms for day of year (doy), weekday, age, sex, and an interaction term
+# The reduced model omits the effect of doy
+model_output <- pnc.long %>%
+  group_by(Factor) %>%
+  summarise(model = list(bam(
+    Score~
+      s(doy,bs = "cc", k = 52)+
+      s(weekdaynum, bs = "cc", k = 7)+
+      s(age,k=10)+ # high k allows for asymptote
+      osex+
+      ti(age,doy,bs = c("tp","cc"),k=c(10,10)), # bivariate smooth interaction term where doy effect varies across age
+    method="REML")), # fit a model for each factor
+    reduced_model = list(bam(
+      Score~
+        s(age,k=10)+
+        s(weekdaynum, bs = "cc", k = 7)+
+        osex,
+      method="REML"))) # reduced model with no doy effect
+
+# Tidy up the model output for easier display by extracting the p-values for the effect of "doy"
+# Apply a false discovery rate correction (pfdr) for multiple comparisons
+tidy_model <- model_output %>%
+  mutate(tidy = map(model, function(x) {
+    tidydf = broom::tidy(x)
+    tidydf$N = length(x$residuals)
+    tidydf
+  })) %>%
+  unnest(tidy) %>%
+  select(-model, -reduced_model) %>%
+  filter(str_detect(term, "doy")) %>%
+  mutate(pfdr = p.adjust(p.value)) %>%
+  relocate(N, .before = "edf")
+
+# Display the tidied model output as a table using kableExtra
+tidy_model %>% kableExtra::kbl(escape = F) %>% kableExtra::kable_classic(html_font = "Cambria")
+
+# Calculate the partial R-squared for each model to evaluate the relative importance of the doy effect
+r2_model <- model_output %>%
+  mutate(partialr2 = map2(.x = model, .y = reduced_model, .f = ~ partialR2(full_mod = .x, reduced_mod = .y))) %>%
+  unnest(partialr2) %>%
+  select(-model, -reduced_model)
+
+# Display the partial R-squared table using kableExtra
+r2_model %>% kableExtra::kbl(escape = F) %>% kableExtra::kable_classic(html_font = "Cambria")
+
+# Retrieve the median age of the ABCD sample, converting from days to months
+abcdy1.ages <- abcd.df %>% select(age) 
+median.abcdy1 <- median(abcdy1.ages$age / 30.4)
+
+# Prepare a new data frame with specific covariates set for plotting (age, weekday, doy, sex)
+newdf <- with(pnc, expand_grid(age = median.abcdy1,
+                              weekdaynum = 3,
+                              doy = seq(from = 1, to = 365, by = .2),
+                              osex = "M"))
+
+# Generate predictions for younger individuals (using median age) for each factor and plot the results
+plot.data.pnc.young <- model_output %>%
+  select(-reduced_model) %>%
+  mutate(plot.df = map(.x = model,
+                       .f = ~ make.plot.df(.x, term = "doy",
+                                           int.term = "age",
+                                           newdata = newdf, add.intercept = FALSE) %>%
+                         mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw), orders = "j")))) %>%
+  unnest(plot.df) %>%
+  select(-model) %>%
+  mutate(Factor = factor(Factor, levels = c("NAR_Overall_Efficiency", "NAR_F1_Social_Cognition_Efficiency", 
+                                           "NAR_F2_Complex_Reasoning_Efficiency", "NAR_F3_Executive_Efficiency", 
+                                           "NAR_F4_Memory_Efficiency"), 
+                         labels = c("Overall", "Social", "Complex", "Executive", "Memory")))
+
+# Prepare a new data frame for older individuals (age = 20*12) and generate predictions for each factor
+old.df <- with(pnc, expand_grid(age = 20 * 12,
+                                weekdaynum = 3,
+                                doy = seq(from = 1, to = 365, by = .2),
+                                osex = "M"))
+
+# Generate predictions for older individuals and plot the results
+plot.data.pnc.old <- model_output %>%
+  mutate(plot.df = map(.x = model,
+                       .f = ~ make.plot.df(.x, term = "doy",
+                                           int.term = "age",
+                                           add.intercept = FALSE,
+                                           newdata = old.df) %>%
+                         mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw), orders = "j")))) %>%
+  unnest(plot.df) %>%
+  select(-model, -reduced_model) %>%
+  mutate(Factor = factor(Factor, levels = c("NAR_Overall_Efficiency", "NAR_F1_Social_Cognition_Efficiency", 
+                                           "NAR_F2_Complex_Reasoning_Efficiency", "NAR_F3_Executive_Efficiency", 
+                                           "NAR_F4_Memory_Efficiency"), 
+                         labels = c("Overall", "Social", "Complex", "Executive", "Memory")))
+
+# Calculate the minimum and maximum predicted values for each factor (across the year)
+pnc.factors.mins <- model_output %>% 
+  mutate(minmax = map(.x = model, .f = ~ gam.posterior.smooths.circular(.x, return_draws = FALSE, smooth_var = "doy", 
+                                                                      newdata = newdf, cov_list = c("age")))) %>%
+  unnest(minmax) %>%
+  select(Factor, minmax) %>%
+  unnest(minmax) %>%
+  filter(is.na(max.y)) %>%
+  mutate(across(.cols = where(is.numeric), .fns = ~ lubridate::parse_date_time(as.character(floor(.)), orders = "j")))
+
+# Calculate the minimum and maximum predicted values for older individuals
+pnc.factors.mins.old <- model_output %>% 
+  mutate(minmax = map(.x = model, .f = ~ gam.posterior.smooths.circular(.x, return_draws = FALSE, smooth_var = "doy", 
+                                                                        newdata = old.df, make_plots = FALSE, cov_list = c("age")))) %>%
+  unnest(minmax) %>%
+  select(Factor, minmax) %>%
+  unnest(minmax) %>%
+  filter(is.na(max.y)) %>%
+  mutate(study = "PNC_Adult") %>%
+  mutate(across(.cols = where(is.numeric), .fns = ~ lubridate::parse_date_time(as.character(floor(.)), orders = "j")))
+
+# Combine tidy model output and partial R-squared results into a table for display
+table.pnc <- left_join(tidy_model, r2_model) %>%
+  mutate(Factor = factor(Factor, 
+                         levels = c("NAR_Overall_Efficiency", "NAR_F1_Social_Cognition_Efficiency", 
+                                    "NAR_F2_Complex_Reasoning_Efficiency", "NAR_F3_Executive_Efficiency", 
+                                    "NAR_F4_Memory_Efficiency"), 
+                         labels = c("Overall", "Social", "Complex", "Executive", "Memory"))) %>%
+  unite(col = "Factor", all_of(c("Factor", "term"))) %>%
+  select(Factor, N, edf, partialr2, p.value, pfdr)
+
+# Rename and finalize the results table
+pnc.results <- table.pnc %>% 
+  mutate(matched_group = "PNC") %>%
+  relocate(matched_group) %>%
+  rename(Sample := matched_group)
+
+
+```
+
+
+#### Plot PNC factors
+Generate plots for the above models to visualize the predicted performance across the year.
+
+```{r}
+
+lines.nine <- ggplot(plot.data.pnc.young,aes(x = doy.raw, y = fit, ymin = lwr, ymax = upr, color = Factor, fill = Factor)) +
+  geom_ribbon(alpha=.1,color=NA)+
+  geom_line(show.legend = T)+
+  scale_color_brewer(type = "seq",palette = "PuBu",direction = -1,aesthetics = c("fill","color"))+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
+  theme(axis.text.x = element_text(angle=45,hjust=1),axis.title.x = element_blank(),legend.title = element_blank(), legend.position = "top")+
+  ylab("Performance")+
+  ggtitle("PNC at median age of ABCD (9.9y)")
+
+lines.twenty <- ggplot(plot.data.pnc.old,aes(x = doy.raw, y = fit, ymin = lwr, ymax = upr, color = Factor, fill = Factor)) +
+  geom_ribbon(alpha=.1,color=NA)+
+  geom_line(show.legend = T, linetype = 2)+
+  scale_color_brewer(type = "seq",palette = "PuBu",direction = -1,aesthetics = c("fill","color"))+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
+  theme(axis.text.x = element_text(angle=45,hjust=1),axis.title.x = element_blank(),legend.title = element_blank(), legend.position = "top")+
+  ylab("Performance (zero centered)")+
+  ggtitle("PNC at median age of ABCD (9.9y)")
+
+#### young and old ####
+pnc.mins.all <- rbind(pnc.factors.mins%>%mutate(study="PNC_9.9y"),pnc.factors.mins.old)%>%
+  mutate(Factor = factor(Factor,levels = c("NAR_Overall_Efficiency","NAR_F1_Social_Cognition_Efficiency","NAR_F2_Complex_Reasoning_Efficiency","NAR_F3_Executive_Efficiency","NAR_F4_Memory_Efficiency"), labels = c("Overall","Social","Complex","Executive","Memory")))%>%
+  mutate(study.label=factor(study,levels=c("PNC_9.9y","PNC_Adult"),labels=c("9.9y","20y")))
+
+
+plot.data.pnc.all <- bind_rows(plot.data.pnc.young%>%mutate(study="PNC_9.9y"), plot.data.pnc.old%>%mutate(study="PNC_20y"))%>%
+  mutate(study.label=factor(study,levels=c("PNC_9.9y","PNC_20y"),labels=c("9.9y","20y")),
+         factor.int = interaction(study.label,Factor))
+
+pnc.lines.old.young <- ggplot(plot.data.pnc.all %>% na.omit(),
+                              aes(x=doy.raw,
+                                  y=fit,
+                                  linetype=study.label,
+                                  color=Factor,
+                                  fill=Factor,
+                                  group=factor.int,
+                                  ymin=lwr,
+                                  ymax=upr)
+) +
+  geom_ribbon(alpha=.1,color=NA)+
+  geom_line(show.legend = T)+
+  scale_color_brewer(type = "seq",palette = "PuBu",aesthetics = c("fill","color"),direction = -1)+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
+  theme(axis.text.x = element_text(angle=45,hjust=1),axis.title.x = element_blank())+
+  ylab("Performance")+
+  ggtitle("PNC: Penn Computerized Neurocognitive Battery")+
+  theme(legend.title = element_blank(),legend.position = "top")
+pnc.lines.old.young
+
+# PLOT THE MINS #
+
+## Build rectangles
+# Add two new rows for each row where upper < lower
+
+rect.tibble <- pnc.mins.all %>%
+  mutate_if(is.POSIXct, as.Date) %>%  # Convert all date-time columns to date for easier comparison
+  filter(upper < lower) %>%
+  rowwise() %>%
+  do(bind_rows(., tibble(
+    Factor = .$Factor,
+    study.label = .$study.label,
+    max.y = NA,
+    lower = as.Date("2024-01-01"),
+    upper = .$upper,
+    min.y = .$min.y
+  ), tibble(
+    Factor = .$Factor,
+    study.label = .$study.label,
+    max.y = NA,
+    lower = .$lower,
+    upper = as.Date("2024-12-31"),
+    min.y = .$min.y
+  ))) %>%
+  ungroup() %>%
+  rbind(pnc.mins.all)%>%
+  arrange(Factor)%>%
+  filter(upper>lower)%>%
+  mutate(ymin=as.numeric(factor(Factor))-.5,ymax=ymin+1)%>%
+  mutate_if(is.Date, as.POSIXct)
+
+# Plot rectangles
+radial.nine<-ggplot(rect.tibble%>%filter(study=="PNC_9.9y"),aes(y=Factor,
+                       x=min.y,
+                       xmin=lower,
+                       xmax=upper,
+                       ymin=ymin,
+                       ymax=ymax,
+                       fill=Factor,
+                       color=Factor))+
+  geom_rect(alpha=.25,color=NA)+
+  geom_point()+
+  scale_color_brewer(type = "seq",palette = "PuBu",aesthetics = c("fill","color"),direction = -1)+
+  scale_x_datetime(date_labels = "%B",
+                   limits = lubridate::parse_date_time(c("1","365"),orders="j"),
+                   date_breaks = "1 months")+
+  theme_minimal_grid()+
+  theme(axis.text.x=element_text(hjust = 1),
+        axis.title = element_blank(),
+        axis.line = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major.y = element_blank(),
+        legend.position = "bottom",
+        legend.title = element_blank())+
+  coord_polar(start = -pi/365,clip = "off")+
+  ggtitle("Day of minimum performance at age 9.9y")+theme(plot.title = element_text(face = "plain"))
+
+radial.twenty<-ggplot(rect.tibble%>%filter(study.label=="20y"),aes(y=Factor,
+                       x=min.y,
+                       xmin=lower,
+                       xmax=upper,
+                       ymin=ymin,
+                       ymax=ymax,
+                       fill=Factor,
+                       color=Factor))+
+  geom_rect(alpha=.25,color=NA)+
+  geom_point()+
+  scale_color_brewer(type = "seq",palette = "PuBu",aesthetics = c("fill","color"),direction = -1)+
+  scale_x_datetime(date_labels = "%B",
+                   date_breaks = "1 months")+
+  theme_minimal_grid()+
+  theme(axis.text.x=element_text(hjust = 1),
+        axis.title = element_blank(),
+        axis.line = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major.y = element_blank(),
+        legend.position = "bottom",
+        legend.title = element_blank())+
+  coord_polar(start = -pi/365,clip = "off")+
+  ggtitle("Day of minimum performance at age 20y")+theme(plot.title = element_text(face = "plain"))
+
+radial.all<-ggplot(rect.tibble,aes(y=Factor,
+                       x=min.y,
+                       xmin=lower,
+                       xmax=upper,
+                       ymin=ymin,
+                       ymax=ymax,
+                       fill=Factor,
+                       color=Factor))+
+  geom_rect(alpha=.25,color=NA)+
+  geom_point()+
+  scale_color_brewer(type = "seq",palette = "PuBu",aesthetics = c("fill","color"),direction = -1)+
+  scale_x_datetime(date_labels = "%B",
+                   date_breaks = "1 months")+
+  theme_minimal_grid()+
+  theme(axis.text.x=element_text(hjust = 1),
+        axis.title = element_blank(),
+        axis.line = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.spacing = unit(2, "lines"),
+        legend.position = "none",
+        legend.title = element_blank())+
+  coord_polar(start = -pi/365,clip = "off")+
+  ggtitle("Day of minimum performance")+theme(plot.title = element_text(face = "plain"))+
+  facet_wrap(~study.label,labeller = labeller(study.label = 
+    c("9.9y" = "Age 9.9y",
+      "20y" = "Age 20y")))
+
+cowplot::save_plot('Figs/PNC.radial.20.svg',radial.twenty)
+cowplot::save_plot('Figs/PNC.radial.9.svg',radial.nine) 
+cowplot::save_plot('Figs/PNC.radial.all.svg',radial.all,base_asp = 1.5) 
+cowplot::save_plot('Figs/PNC.lines.9.svg',lines.nine,base_asp = .88,base_height = 4) 
+cowplot::save_plot('Figs/PNC.lines.20.svg',lines.twenty,base_asp = .88,base_height = 4) 
+cowplot::save_plot('Figs/PNC.lines.all.svg',pnc.lines.old.young,base_asp = .88,base_height = 4)
+```
+
+# ADHD 1000
+
+```{r}
+interview.dates <- fread('Data/ADHD1000/Visit_dates.csv',sep = ",",na.strings = "\n")
+interview.dates <- read.csv('Data/ADHD1000/Visit_dates.csv',sep = ",",na.strings = " ") %>% mutate(across(contains("Date"),~as.Date(.x,format="%m/%d/%y")))
+long.interview.dates <- interview.dates %>% 
+  select(Mergeid,contains("Date"))%>%
+  pivot_longer(cols = contains("Date"),names_to = "VisitLabel",values_to = "interview.date")%>%
+  filter(!VisitLabel%in%c("V1_Date","Decision_Date"))%>%
+  mutate(interview.year = year(interview.date),
+         src_subject_id = factor(Mergeid))%>%
+  mutate(VisitLabel = if_else(VisitLabel=="V2_Date","Y1",str_remove(VisitLabel, "_.*")))
+
+# Prs stuff
+prs.df <- fread('Data/ADHD1000/Oregon-ADHD-1000_imaging_demo_pheno_prs.csv',sep = ",")%>%
+  mutate(src_subject_id = factor(MERGEID))
+adhd.scores <- fread('Data/ADHD1000/OHSU_earliest_visit.csv',sep = ",")
+
+# DTeam dx
+dx.df <- fread('Data/ADHD1000/CleanY1-Y13Dteam.csv',sep = ",")
+long.dx.df <- dx.df %>%
+  select(Mergeid, matches("^Y([1-9]|1[0-3])_Adhd_Status$"))%>%
+  pivot_longer(cols = contains("Adhd_Status"),names_to = "VisitLabel",values_to = "Status") %>%
+  mutate(VisitLabel = str_remove(VisitLabel, "_Adhd_Status"))
+
+# Join DTeam and interview dates
+long.interview.dates <- long.interview.dates %>%
+  left_join(long.dx.df)
+
+# CPT (vars: dprime1	dprime2	cbiasc	cbiass	lnb_c	lnb_s)
+CPT.names <- fread('Data/ADHD1000/nonimaging_data/collection2857/cpth01.txt')
+CPT <- fread('Data/ADHD1000/nonimaging_data/collection2857/cpth01.txt',skip = 2)
+names(CPT) <- names(CPT.names)
+CPT.names2 <- fread('Data/ADHD1000/nonimaging_data/collection3222/cpth01.txt')
+CPT2 <- fread('Data/ADHD1000/nonimaging_data/collection3222/cpth01.txt',skip = 2)
+names(CPT2) <- names(CPT.names2)
+
+CPT <- CPT %>%
+  bind_rows(CPT2)%>%
+  na.omit(cols = "dprime1")%>%
+  select(where(~ !all(is.na(.))))%>%
+  group_by(src_subject_id, visit_year) %>%
+  summarise(
+    across(contains("cpt"), ~ mean(.x, na.rm = TRUE)),
+    across(-contains("cpt"), ~ first(.x)) # Keep the first value for non-dkefs columns
+  ) %>%
+  mutate(interview_date=as.Date(interview_date,format="%m/%d/%Y"),
+         interview.year = year(interview_date),
+         src_subject_id = factor(src_subject_id))
+
+# Stop signal: Vars stop_mrt_int
+SS.names <- fread('Data/ADHD1000/nonimaging_data/collection2857/stopsig01.txt')
+SS <- fread('Data/ADHD1000/nonimaging_data/collection2857/stopsig01.txt',skip = 2)
+names(SS) <- names(SS.names)
+SS.names2 <- fread('Data/ADHD1000/nonimaging_data/collection3222/stopsig01.txt')
+SS2 <- fread('Data/ADHD1000/nonimaging_data/collection3222/stopsig01.txt',skip = 2)
+names(SS2) <- names(SS.names2)
+
+SS <- SS %>%
+  bind_rows(SS2)%>%
+  select(where(~ !all(is.na(.))))%>%
+  mutate(interview_date=as.Date(interview_date,format="%m/%d/%Y"),
+         interview.year = year(interview_date),
+         src_subject_id = factor(src_subject_id))
+
+# Spatial Span: Vars: ssbk_numcomplete
+Spat.names <- fread('Data/ADHD1000/nonimaging_data/collection2857/spatspan01.txt')
+Spat <- fread('Data/ADHD1000/nonimaging_data/collection2857/spatspan01.txt',skip = 2)
+names(Spat) <- names(Spat.names)
+Spat.names2 <- fread('Data/ADHD1000/nonimaging_data/collection3222/spatspan01.txt')
+Spat2 <- fread('Data/ADHD1000/nonimaging_data/collection3222/spatspan01.txt',skip = 2)
+names(Spat2) <- names(Spat.names2)
+
+Spat <- Spat %>%
+  bind_rows(Spat2)%>%
+  select(where(~ !all(is.na(.))))%>%
+  mutate(interview_date=as.Date(interview_date,format="%m/%d/%Y"),
+         interview.year = year(interview_date),
+         src_subject_id = factor(src_subject_id))
+
+#N-Back: Vars: n1backacc	n2backacc
+NBack.names <- fread('Data/ADHD1000/nonimaging_data/collection2857/nback01.txt')
+NBack <- fread('Data/ADHD1000/nonimaging_data/collection2857/nback01.txt',skip = 2)
+names(NBack) <- names(NBack.names)
+NBack.names2 <- fread('Data/ADHD1000/nonimaging_data/collection3222/nback01.txt')
+NBack2 <- fread('Data/ADHD1000/nonimaging_data/collection3222/nback01.txt',skip = 2)
+names(NBack2) <- names(NBack.names2)
+
+NBack <- NBack %>%
+  bind_rows(NBack2)%>%
+  select(where(~ !all(is.na(.))))%>%
+  mutate(interview_date=as.Date(interview_date,format="%m/%d/%Y"),
+         interview.year = year(interview_date),
+         src_subject_id = factor(src_subject_id))
+
+#Happiness: shs_avg
+Hap.names <- fread('Data/ADHD1000/nonimaging_data/collection2857/shs01.txt')
+Hap <- fread('Data/ADHD1000/nonimaging_data/collection2857/shs01.txt',skip = 2)
+names(Hap) <- names(Hap.names)
+Hap.names2 <- fread('Data/ADHD1000/nonimaging_data/collection3222/shs01.txt')
+Hap2 <- fread('Data/ADHD1000/nonimaging_data/collection3222/shs01.txt',skip = 2)
+names(Hap2) <- names(Hap.names2)
+
+Hap <- Hap %>%
+  bind_rows(Hap2)%>%
+  select(where(~ !all(is.na(.))))%>%
+  mutate(interview_date=as.Date(interview_date,format="%m/%d/%Y"),
+         interview.year = year(interview_date),
+         src_subject_id = factor(src_subject_id))
+
+# DKEFS
+ADHD.dkefs.names <- fread('Data/ADHD1000/nonimaging_data/collection2857/dkefs01.txt')
+ADHD.dkefs <- fread('Data/ADHD1000/nonimaging_data/collection2857/dkefs01.txt',skip = 2)
+names(ADHD.dkefs) <- names(ADHD.dkefs.names)
+ADHD.dkefs.names2 <- fread('Data/ADHD1000/nonimaging_data/collection3222/dkefs01.txt')
+ADHD.dkefs2 <- fread('Data/ADHD1000/nonimaging_data/collection3222/dkefs01.txt',skip = 2)
+names(ADHD.dkefs2) <- names(ADHD.dkefs.names2)
+
+ADHD.dkefs <- ADHD.dkefs %>%
+  bind_rows(ADHD.dkefs2)%>%
+  select(where(~ !all(is.na(.))))%>%
+  group_by(src_subject_id, visit_year) %>%
+  summarise(
+    across(contains("dkefs"), ~ if_else(all(is.na(.x)), NA_real_, mean(.x, na.rm = TRUE))),
+    across(-contains("dkefs"), ~ first(.x))  # Keep the first value for non-dkefs columns
+  ) %>%
+  ungroup()%>%
+  # na.omit("dkefs_colorword3_scaled")%>%
+  mutate(interview_date=as.Date(interview_date,format="%m/%d/%Y"),
+         interview.year = year(interview_date),
+         src_subject_id = factor(src_subject_id))
+
+adhd.cog.scores <- ADHD.dkefs %>%
+  full_join(CPT,by = c("src_subject_id","visit_year","sex","interview_age","subjectkey"))%>%
+  full_join(SS,by = c("src_subject_id","visit_year","sex","interview_age","subjectkey"))%>%
+  full_join(Spat,by = c("src_subject_id","visit_year","sex","interview_age","subjectkey"))%>%
+  full_join(NBack,by = c("src_subject_id","visit_year","sex","interview_age","subjectkey"))%>%
+  full_join(Hap,by = c("src_subject_id","visit_year","sex","interview_age","subjectkey"))%>%
+  group_by(src_subject_id, visit_year) %>%
+  summarise(
+    across(where(is.numeric), ~ if_else(all(is.na(.x)), NA_real_, mean(.x, na.rm = TRUE))),
+    across(where(~ !is.numeric(.x)), ~ first(.x))  # Keep the first value for non-dkefs columns
+  ) %>%
+  ungroup()
+
+adhd.cog.scores.dates <- adhd.cog.scores %>% 
+  full_join(long.interview.dates%>%
+              mutate(visit_year = as.numeric(str_extract(VisitLabel, "\\d+"))),by = c("visit_year", "src_subject_id")) %>%
+  mutate(weekday = weekdays(interview.date),
+         doy = yday(interview.date))%>%
+  left_join(weekdaykey)
+
+adhd.clin <- prs.df %>%
+  left_join(adhd.scores)
+adhd.df <- adhd.cog.scores.dates%>%
+  left_join(adhd.clin,by = c("visit_year"="YEAR","src_subject_id"))%>%
+  mutate(Y1_ADHD_STATUS = factor(Y1_ADHD_STATUS),
+         sex = factor(sex),
+         visit_year = ordered(visit_year),
+         race.factor=factor(CHILD_RACE1, levels = 1:6,labels=levels(abcd.df$race.6level)))%>%
+  filter(Status %in% c(1,3))%>%
+  filter(!is.na(x = interview_age))%>%
+  mutate(ADHD_Status = factor(Status, levels = c(1,3),labels = c("Control","ADHD")),
+         DKEFS.EF = dkefs_trail4_raw+dkefs_colorword3_raw,
+         CPT.dprime = (dprime1+dprime2)/2)
+
+# Create DKEFS residual variables
+cw.mod <- lme4::lmer(dkefs_colorword3_scaled ~ dkefs_colorword1_scaled + dkefs_colorword2_scaled + visit_year + (1|src_subject_id),data = adhd.df)
+cw.resid <- resid(cw.mod)
+cw.df <- cw.mod@frame
+cw.df$dkefs_colorword3_residuals <- cw.resid
+
+trails.mod <- lme4::lmer(dkefs_trail4_scaled ~ dkefs_trail2_scaled + dkefs_trail3_scaled + visit_year +(1|src_subject_id),data = adhd.df)
+trails.resid <- resid(trails.mod)
+trails.df <- trails.mod@frame%>%
+  mutate(visit_year = ordered(visit_year,levels = levels(cw.df$visit_year)))
+trails.df$dkefs_trails4_residuals <- trails.resid
+
+adhd.df <- adhd.df %>% 
+  left_join(cw.df %>% select(dkefs_colorword3_residuals,src_subject_id,visit_year))%>% 
+  left_join(trails.df %>% select(dkefs_trails4_residuals,src_subject_id,visit_year))%>%
+  filter(!is.na(interview_age))%>%
+  filter(if_any(c(dkefs_colorword3_raw, dkefs_trail4_raw, n1backacc, 
+                  n2backacc, ssbk_numcomplete, stop_mrt_int, dprime1), 
+                ~ !is.na(.))) # need a score for at least one of these tests
+  
+sprintf("Number of unique ADHD-1000 participants: %d",length(unique(adhd.df$src_subject_id)))
+sprintf("Number of ADHD-1000 observations: %d",length(adhd.df$src_subject_id))
+```
+
+### All tasks: group*doy effect
+```{r}
+# Define cognitive scores and corresponding polished labels
+cog.score.labels <- c("dkefs_colorword3_raw", "dkefs_trail4_raw", "n2backacc", "ssbk_numcomplete", "stop_mrt_int", "dprime1")
+polished.labels = c("Color-Word Interference", "Trails B", "2-Back", "Spatial Span", "Stop-Go RT", "CPT D'")
+
+# Scale cognitive scores and re-calculate certain variables (reverse scoring for some)
+scores.long <- adhd.df %>% 
+  mutate(across(cog.score.labels, scale),  # Standardize the scores
+         across(c("dkefs_colorword3_raw", "dkefs_trail4_raw", "stop_mrt_int"), ~.x * -1)) %>%  # Reverse score for specific tasks
+  pivot_longer(cols = cog.score.labels, names_to = "cog.scale", values_to = "score") %>%  # Pivot longer to convert scores to a long format
+  mutate(oADHD_Status = ordered(ADHD_Status)) %>%  # Ensure ADHD_Status is an ordered factor
+  mutate(cog.scale = factor(cog.scale, levels = cog.score.labels, labels = polished.labels))  # Relabel cognitive scales
+
+# Fit model by cognitive scale, accounting for group and day of year (doy) effects
+model_output.by <- scores.long %>%
+  group_by(cog.scale) %>%
+  summarise(model = list(bam(  # Fit a generalized additive model (GAM)
+    score ~
+      s(interview_age) +  # Smooth term for age
+      s(weekdaynum, bs = "cc", k = 6) +  # Smooth term for weekday number (cyclic basis)
+      visit_year +  # Include visit year as a fixed effect
+      s(doy, bs = "cc", k = 52) +  # Smooth term for day of year (cyclic)
+      oADHD_Status +  # ADHD status as a factor
+      s(doy, by = oADHD_Status, bs = "cc", k = 13) +  # Interaction between doy and ADHD status
+      ti(interview_age, doy, bs = c("tp", "cc"), k = c(10, 13)) +  # Interaction between age and doy
+      s(src_subject_id, bs = "re") +  # Random effect for subject ID
+      sex,  # Include sex as a fixed effect
+    method = "fREML", discrete = T)),  # Fit using restricted maximum likelihood
+  reduced_model = list(bam(  # Fit reduced model for comparison
+    score ~
+      s(interview_age, sp = model$sp["s(interview_age)"]) +  # Use selected smoothing parameters from the model
+      s(weekdaynum, bs = "cc", k = 7, sp = model$sp["s(weekdaynum)"]) +
+      visit_year + 
+      oADHD_Status + 
+      ti(interview_age, doy, bs = c("tp", "cc"), k = c(10, 13), sp = model$sp[str_detect(string = names(model$sp), pattern = 'ti')]) +
+      s(src_subject_id, bs = "re") +
+      sex,  # Random effects and sex included in reduced model
+    method = "fREML", discrete = T)))
+
+# Tidy up model results and calculate FDR-corrected p-values for 'doy' terms
+tidy_model.by <- model_output.by %>%
+  mutate(tidy = map(model, function(x) {
+    tidydf = broom::tidy(x)  # Tidy up the model output
+    tidydf$N = length(x$residuals)  # Add number of residuals to the output
+    tidydf
+  })) %>%
+  unnest(tidy) %>%
+  select(-model, -reduced_model) %>%
+  filter(str_detect(string = term, pattern = "doy")) %>%  # Filter for terms related to 'doy'
+  group_by(term) %>%
+  mutate(p.fdr = p.adjust(p.value, "fdr")) %>%  # Apply FDR correction to p-values
+  relocate(N, .before = "edf")  # Move 'N' column before 'edf'
+
+# Table of results, sorted by term and p-value, and formatted for display
+tidy_model.by %>% kableExtra::kbl(escape = F) %>% kableExtra::kable_classic(html_font = "Cambria")
+
+# Calculate partial R^2 for the models to understand the variance explained by specific terms
+r2.model.by <- model_output.by %>%
+  mutate(partialr2 = map2(.x = model, .y = reduced_model, .f = ~ partialR2(full_mod = .x, reduced_mod = .y))) %>%
+  unnest(partialr2) %>%
+  select(-model, -reduced_model)
+
+# Calculate partial eta-squared for effect sizes related to 'doy'
+eta_model.by <- model_output.by %>% 
+  mutate(partialeta2 = map(model, eta_squared)) %>%
+  unnest(partialeta2) %>%
+  select(-model, -reduced_model) %>%
+  filter(str_detect(Parameter, "doy"))
+
+# Combine ADHD group and 'doy' results with eta-squared and partial R^2
+table.adhd1000.supplement <- tidy_model.by %>% 
+  select(cog.scale, edf, p.value, p.fdr) %>%
+  left_join(eta_model.by %>% select(cog.scale, Parameter, Eta2_partial), by = c("cog.scale", "term" = "Parameter")) %>%
+  filter(term != "s(doy)") %>%
+  rename("partialR2" := Eta2_partial)  # Rename column for clarity
+
+# Save the results as a CSV file
+adhd1000.results.supplement <- table.adhd1000.supplement
+write.table(adhd1000.results.supplement, "./Tables/ADHD1000.task.results.supplement.csv", sep = ",", row.names = F)
+
+```
+
+#### Plot (supplement)
+```{r, fig.height=6,fig.width=6}
+
+# Define new dataset for plotting clinical effects by ADHD status
+newdata = expand_grid(interview_age = c(median(as.numeric(abcd.df$interview_age))), 
+                       doy = 1:365,
+                       ADHD_Status = c("ADHD", "Control"), 
+                       sex = "M",
+                       visit_year = levels(adhd.df$visit_year)[1],
+                       weekdaynum = 2,
+                       src_subject_id = levels(adhd.df$src_subject_id)[1])
+
+# Generate data for plotting by running model predictions
+adhd.plot.data <- model_output %>%
+  mutate(plot.df = map(.x = model,
+                       .f = ~ make.plot.df(.x, term = "doy", int.term = c("interview_age", "ADHD_Status"), newdata = newdata) %>%
+                         mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw), orders = "j")))) %>%
+  unnest(plot.df) %>%
+  select(-model)
+
+# Create plot comparing ADHD vs neurotypical performance at age 9.9
+supp.adhd.typical.9y <- ggplot(adhd.plot.data %>% mutate(ADHD_Status = factor(ADHD_Status.raw, levels = c("ADHD", "Control"), labels = c("ADHD", "Neurotypical"))),
+       aes(x = doy.raw, y = fit, ymin = lwr, ymax = upr, color = ADHD_Status.raw, fill = ADHD_Status.raw)) +
+  geom_ribbon(alpha = .2, color = NA) +  # Add shaded region for confidence intervals
+  geom_line(size = 1.5) +  # Add line for the fitted values
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +  # Format x-axis as months
+  theme(axis.text.x = element_text(angle = 60, hjust = 1), axis.title.x =  element_blank(), legend.position = "top", legend.title = element_blank()) +
+  facet_wrap(~cog.scale, scales = "free_y", nrow = 3) +  # Create facets for each cognitive scale
+  ylab("Performance (z-score)") +  # Y-axis label
+  ggtitle("Performance at age 9.9y")
+
+# Save the plot as an SVG file
+cowplot::save_plot('Figs/ADHD.supp.vs.typical.age9.svg', supp.adhd.typical.9y, base_height = 9, base_width = 9)
+
+# Create plot for the effect of 'doy' across all ADHD status levels
+ggplot(adhd.plot.data, aes(x = doy.raw, y = fit, ymin = lwr, ymax = upr, color = cog.scale, fill = cog.scale)) +
+  geom_ribbon(alpha = .25, color = NA) +  # Add shaded region for confidence intervals
+  geom_line(size = 1.5) +  # Add line for the fitted values
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +  # Format x-axis as months
+  theme(axis.text.x = element_text(angle = 60, hjust = 1), axis.title.x =  element_blank(), legend.position = "top", legend.title = element_blank()) +
+  facet_wrap(~cog.scale, scales = "free_y", nrow = 3) +  # Create facets for each cognitive scale
+  ylab("Performance (z-score)") +  # Y-axis label
+  ggtitle("ADHD status effect across 'doy'")
+
+
+```
+
+#### Radial plots
+```{r}
+# Mins for ADHD
+
+newdata =  expand_grid(interview_age=c(median(as.numeric(abcd.df$interview_age))), #,
+                       doy=1:365,
+                       ADHD_Status = c("ADHD"), #,"ADHD"
+                       sex="M",
+                       visit_year = levels(adhd.df$visit_year)[1],
+                       weekdaynum=2,
+                       src_subject_id = levels(adhd.df$src_subject_id)[1])
+
+adhd.factors.mins <- model_output %>% 
+  mutate(minmax = map(.x=model,.f=~gam.posterior.smooths.circular(.x,
+                                                                  return_draws = FALSE,
+                                                                  smooth_var="doy",
+                                                                  newdata = newdata,
+                                                                  cov_list=c("interview_age","ADHD_Status")))) %>%
+  unnest(minmax)%>%
+  select(cog.scale,minmax)%>%
+  unnest(minmax)%>%
+  filter(is.na(max.y))%>%
+  mutate(across(.cols=where(is.numeric),.fns=~lubridate::parse_date_time(as.character(floor(.)),orders="j")))
+
+## Build rectangles
+# Add two new rows for each row where upper < lower
+rect.tibble <- adhd.factors.mins %>%
+  mutate_if(is.POSIXct, as.Date) %>%  # Convert all date-time columns to date for easier comparison
+  filter(upper < lower) %>%
+  rowwise() %>%
+  do(bind_rows(., tibble(
+    cog.scale = .$cog.scale,
+    max.y = NA,
+    lower = as.Date("2024-01-01"),
+    upper = .$upper,
+    min.y = .$min.y
+  ), tibble(
+    cog.scale = .$cog.scale,
+    max.y = NA,
+    lower = .$lower,
+    upper = as.Date("2024-12-31"),
+    min.y = .$min.y
+  ))) %>%
+  ungroup() %>%
+  rbind(adhd.factors.mins)%>%
+  filter(upper>lower)%>%
+  mutate(ymin=as.numeric(factor(cog.scale))-.5,ymax=ymin+1)%>%
+  mutate_if(is.Date, as.POSIXct)
+# Plot rectangles
+ADHD.radial <- ggplot(rect.tibble,aes(y=cog.scale,
+                       x=min.y,
+                       xmin=lower,
+                       xmax=upper,
+                       ymin=ymin,
+                       ymax=ymax,
+                       fill=cog.scale,
+                       color=cog.scale))+
+  geom_rect(alpha=.25,color=NA)+
+  geom_point()+
+  scale_color_brewer(type = "qual",palette = "Set2",aesthetics = c("fill","colour"))+
+  scale_x_datetime(date_labels = "%B",
+                   # limits = lubridate::parse_date_time(c("1","365"),orders="j"),
+                   date_breaks = "1 months")+
+  cowplot::theme_minimal_grid()+
+  theme(axis.text.x=element_text(hjust = 1,vjust = -2),
+        axis.title = element_blank(),
+        axis.line.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major.y = element_blank(),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        plot.title = element_text(face = "plain"))+
+  coord_polar(start = -pi/365,clip = "off")+
+  ggtitle("ADHD")
+
+# Mins for control
+newdata =  expand_grid(interview_age=c(median(as.numeric(abcd.df$interview_age))), #,
+                       doy=1:365,
+                       ADHD_Status = c("Control"), #,"ADHD"
+                       sex="M",
+                       visit_year = levels(adhd.df$visit_year)[1],
+                       weekdaynum=2,
+                       src_subject_id = levels(adhd.df$src_subject_id)[1])
+
+control.factors.mins <- model_output %>% 
+  mutate(minmax = map(.x=model,.f=~gam.posterior.smooths.circular(.x,
+                                                                  return_draws = FALSE,
+                                                                  smooth_var="doy",
+                                                                  newdata = newdata,
+                                                                  cov_list=c("interview_age","ADHD_Status")))) %>%
+  unnest(minmax)%>%
+  select(cog.scale,minmax)%>%
+  unnest(minmax)%>%
+  filter(is.na(max.y))%>%
+  mutate(across(.cols=where(is.numeric),.fns=~lubridate::parse_date_time(as.character(floor(.)),orders="j")))
+
+## Build rectangles
+# Add two new rows for each row where upper < lower
+rect.tibble <- control.factors.mins %>%
+  mutate_if(is.POSIXct, as.Date) %>%  # Convert all date-time columns to date for easier comparison
+  filter(upper < lower) %>%
+  rowwise() %>%
+  do(bind_rows(., tibble(
+    cog.scale = .$cog.scale,
+    max.y = NA,
+    lower = as.Date("2024-01-01"),
+    upper = .$upper,
+    min.y = .$min.y
+  ), tibble(
+    cog.scale = .$cog.scale,
+    max.y = NA,
+    lower = .$lower,
+    upper = as.Date("2024-12-31"),
+    min.y = .$min.y
+  ))) %>%
+  ungroup() %>%
+  rbind(control.factors.mins)%>%
+  filter(upper>lower)%>%
+  mutate(ymin=as.numeric(factor(cog.scale))-.5,ymax=ymin+1)%>%
+  mutate_if(is.Date, as.POSIXct)
+# Plot rectangles
+Control.radial <- ggplot(rect.tibble,aes(y=cog.scale,
+                       x=min.y,
+                       xmin=lower,
+                       xmax=upper,
+                       ymin=ymin,
+                       ymax=ymax,
+                       fill=cog.scale,
+                       color=cog.scale))+
+  geom_rect(alpha=.25,color=NA)+
+  geom_point()+
+  scale_color_brewer(type = "qual",palette = "Set2",aesthetics = c("fill","colour"))+
+  scale_x_datetime(date_labels = "%B",
+                   # limits = lubridate::parse_date_time(c("1","365"),orders="j"),
+                   date_breaks = "1 months")+
+  cowplot::theme_minimal_grid()+
+  theme(axis.text.x=element_text(hjust = 1,vjust = -2),
+        axis.title = element_blank(),
+        axis.line.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major.y = element_blank(),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        plot.title = element_text(face = "plain"))+
+  coord_polar(start = -pi/365,clip = "off")+
+  ggtitle("Neurotypical")
+
+Control.radial+ADHD.radial + patchwork::plot_annotation("Day of Minimum Performance (age 9.9y)") + 
+  plot_layout(guides = "collect") & theme(legend.position='bottom')
+
+```
+
+### PCA: Overall Performance
+```{r}
+zdf <- adhd.df%>% 
+  mutate(across(cog.score.labels,scale),
+         across(c("dkefs_colorword3_raw","dkefs_trail4_raw", "stop_mrt_int"),~.x*-1))
+pca.mat.full <- zdf %>%
+  select(dkefs_colorword3_raw,dkefs_trail4_raw,n1backacc,n2backacc,ssbk_numcomplete,stop_mrt_int,dprime1)%>%
+  na.omit()
+  
+pca.mat <- as.matrix(pca.mat.full)
+corrplot::corrplot(cor(pca.mat,use = "pairwise.complete.obs",method = "spearman"),method = "square",order = 'hclust',diag = T,addrect = 3 )
+res.pca.all <- prcomp(pca.mat, scale = FALSE,center = FALSE)
+factoextra::fviz_eig(res.pca.all)
+factoextra::fviz_pca_var(res.pca.all,col.var = "contrib")
+
+pca.df <- bind_cols(res.pca.all$x,pca.mat.full)%>%
+  left_join(zdf)%>%
+  mutate(oADHD_Status = ordered(ADHD_Status))
+
+pc.mod <- bam(
+  PC1 ~
+    s(interview_age)+
+    s(weekdaynum, bs = "cc", k = 6) +
+    visit_year + 
+    s(doy, bs = "cc", k = 52) +
+    ti(interview_age,doy,bs = c("tp","cc"),k=c(10,13)) +
+    s(doy,ADHD_Status,bs = "sz",xt=list(bs = "cc",k=13))+
+    s(src_subject_id,bs="re")+
+    sex,
+  method = "fREML",data = pca.df,discrete = T)
+pc.mod.stat.test <- bam(
+  PC1 ~
+    s(interview_age)+
+    s(weekdaynum, bs = "cc", k = 6) +
+    visit_year + 
+    s(doy, bs = "cc", k = 52) +
+    ti(interview_age,doy,bs = c("tp","cc"),k=c(10,13)) +
+    ADHD_Status+
+    s(doy,by = oADHD_Status,k = 26)+
+    s(src_subject_id,bs="re")+
+    sex,
+  method = "fREML",data = pca.df,discrete = T) #this more directly tests the slope interaction specifically
+summary(pc.mod.stat.test)
+pc.mod.reduced <- bam(
+  PC1 ~
+    s(interview_age)+
+    s(weekdaynum, bs = "cc", k = 6) +
+    visit_year + 
+    ti(interview_age,doy,bs = c("tp","cc"),k=c(10,13)) +
+    ADHD_Status+
+    s(src_subject_id,bs="re")+
+    sex,
+  method = "fREML",data = pca.df,discrete = T) #This model keeps the doy*ADHD interaction while preserving the estimation of the overall doy effect (better for vis and interpreting main effects)
+r2 <- partialR2(pc.mod,pc.mod.reduced)
+tidy.pc.mod <- broom::tidy(pc.mod)
+tidy.pc.mod$N = length(pc.mod$residuals)
+tidy.pc.mod$partialr2 <- r2
+tidy.pc.mod <- tidy.pc.mod %>% relocate(N,.before = "edf")
+
+adhd.1000.results <- tidy.pc.mod %>%
+  mutate(Factor="Overall",pfdr = p.value)%>%
+  unite(col = "Factor",all_of(c("Factor","term")))%>%
+  select(Factor,N,edf,partialr2,p.value,pfdr)%>%
+  filter(str_detect(Factor,"doy")&!str_detect(Factor,"ADHD"))%>%
+mutate(matched_group = "ADHD-1000")%>%
+relocate(matched_group)%>%
+rename(Sample:=matched_group)
+
+
+newdata = with(pc.mod$model,
+               expand_grid(interview_age=c(median(as.numeric(abcd.df$interview_age)),20*12),
+                           doy=1:365,
+                           ADHD_Status = levels(ADHD_Status),
+                           sex=levels(sex)[1],
+                           visit_year = levels(visit_year)[1],
+                           weekdaynum=2,
+                           src_subject_id = levels(src_subject_id)[1]))
+
+plot.data.adhd <- make.plot.df(pc.mod,term = "doy",int.term = c("interview_age","ADHD_Status"),newdata=newdata)%>% 
+  mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"))
+
+pcplot.adhd <- ggplot(plot.data.adhd%>%filter(interview_age.raw==119),aes(x=doy.raw,y=fit,color=ADHD_Status.raw ,fill=ADHD_Status.raw ,ymin=lwr,ymax=upr,group=ADHD_Status.raw ))+
+  geom_ribbon(alpha=.25,color=NA)+
+  geom_line(size=1.5)+ 
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
+  # scale_x_datetime(date_labels = "%B",limits = lubridate::parse_date_time(c("1","365"),orders="j"),date_breaks = "1 month")+
+  scale_color_manual(aesthetics = c("fill","color"),
+                     values = dark_purples,
+                     labels = c("ADHD", "Neurotypical"),    # Relabel the factor levels
+                     name = NULL)+
+  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
+  ylab("PC1")
+pcplot.adhd
+
+pcplot.combo <- ggplot(plot.data.adhd,aes(x=doy.raw,
+                                   y=fit,
+                                   color=ADHD_Status.raw,
+                                   fill=ADHD_Status.raw,
+                                   ymin=lwr,
+                                   ymax=upr,
+                                   linetype = factor(interview_age.raw)))+
+  geom_ribbon(alpha=.25,color=NA)+
+  geom_line()+ 
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
+  # scale_x_datetime(date_labels = "%B",limits = lubridate::parse_date_time(c("1","365"),orders="j"),date_breaks = "1 month")+
+  scale_color_manual(aesthetics = c("fill","color"),
+                     values = dark_purples,
+                     labels = c("ADHD", "Neurotypical"),    # Relabel the factor levels
+                     name = NULL) +
+  # scale_linetype_manual(values=c(1,6),labels = c("9.9y", "19y"),    # Relabel the factor levels
+  #                    name = NULL)+
+  ylab("Overall Performance")+ ggtitle("ADHD-1000")+facet_wrap(~interview_age.raw,scales = "free_y")+
+  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top",plot.title = element_text(face = "plain"))+theme(strip.background = element_blank(),legend.position = "top")
+
+cowplot::save_plot('Figs/ADHD.lines.all.Overall.svg',pcplot.combo)
+pcplot.combo
+
+adhd.plot.df.age <- make.plot.df(pc.mod,term = "doy",int.term = c("interview_age"),newdata=newdata)%>% 
+  mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"))
+
+pcplot.age <- ggplot(adhd.plot.df.age,aes(x=doy.raw,y=fit,linetype=factor(interview_age.raw) ,ymin=lwr,ymax=upr,group=factor(interview_age.raw)))+
+  geom_ribbon(alpha=.25,color=NA,fill = dark_purples[2])+
+  geom_line(size=1.5,color = dark_purples[2])+ 
+  scale_x_datetime(date_labels = "%B",limits = lubridate::parse_date_time(c("1","365"),orders="j"),date_breaks = "1 month")+
+  scale_linetype_manual(values=c(1,6),labels = c("9.9y", "20y"),    # Relabel the factor levels
+                     name = NULL)+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
+  # scale_color_manual(aesthetics = c("fill","color"),
+  #                    values = dark_purples,
+  #                    labels = c("9.9", "19"),    # Relabel the factor levels
+  #                    name = "Age (years)") +
+  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
+    ylab("Overall Performance")+ ggtitle("ADHD-1000")
+
+cowplot::save_plot('Figs/ADHD.lines.Age.Overall.svg',pcplot.age,base_asp = 1.25)
+pcplot.age
+
+# Separate for 9.9 and 20y
+ ## 9
+pcplot.age.nine <- ggplot(adhd.plot.df.age%>%filter(interview_age.raw==119),aes(x=doy.raw,y=fit,linetype=factor(interview_age.raw) ,ymin=lwr,ymax=upr,group=factor(interview_age.raw)))+
+  geom_ribbon(alpha=.25,color=NA,fill = dark_purples[2])+
+  geom_line(size=1.5,color = dark_purples[2])+ 
+  scale_x_datetime(date_labels = "%B",limits = lubridate::parse_date_time(c("1","365"),orders="j"),date_breaks = "1 month")+
+  scale_linetype_manual(values=c(1,6),labels = c("9.9y", "20y"),    # Relabel the factor levels
+                     name = NULL)+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
+  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
+    ylab("Performance")+ ggtitle("ADHD-1000")
+
+cowplot::save_plot('Figs/ADHD.lines.Age.9.svg',pcplot.age.nine,base_asp = .88)
+pcplot.age.nine
+ ## 20
+ ## 9
+pcplot.age.twenty <- ggplot(adhd.plot.df.age%>%filter(interview_age.raw==240),aes(x=doy.raw,y=fit,linetype=factor(interview_age.raw) ,ymin=lwr,ymax=upr,group=factor(interview_age.raw)))+
+  geom_ribbon(alpha=.25,color=NA,fill = dark_purples[2])+
+  geom_line(size=1.5,color = dark_purples[2],linetype = 2)+ 
+  # scale_x_datetime(date_labels = "%B",limits = lubridate::parse_date_time(c("1","365"),orders="j"),date_breaks = "1 month")+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
+  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title = element_blank())+
+    ylab("Performance")+ ggtitle("ADHD-1000")
+cowplot::save_plot('Figs/ADHD.lines.Age.20.svg',pcplot.age.twenty,base_asp = .88)
+pcplot.age.twenty
+
+newdata.control =  expand_grid(interview_age=c(median(as.numeric(abcd.df$interview_age))), #,
+                       doy=1:365,
+                       ADHD_Status = c("Control"), #,"ADHD"
+                       sex="M",
+                       visit_year = levels(adhd.df$visit_year)[1],
+                       weekdaynum=2,
+                       src_subject_id = levels(adhd.df$src_subject_id)[1])
+
+newdata.adhd =  expand_grid(interview_age=c(median(as.numeric(abcd.df$interview_age))), #,
+                       doy=1:365,
+                       ADHD_Status = c("ADHD"), #,"ADHD"
+                       sex="M",
+                       visit_year = levels(adhd.df$visit_year)[1],
+                       weekdaynum=2,
+                       src_subject_id = levels(adhd.df$src_subject_id)[1])
+
+model.df <- tibble(cog.scale = c("Control","ADHD"), newdata = c(list(newdata.control),list(newdata.adhd)))
+control.factors.mins <- model.df %>% 
+  mutate(minmax = map(.x=newdata,.f=~gam.posterior.smooths.circular(pc.mod,
+                                                                  return_draws = FALSE,
+                                                                  smooth_var="doy",
+                                                                  newdata = .x,
+                                                                  cov_list=c("interview_age","ADHD_Status")))) %>%
+  unnest(minmax)%>%
+  select(cog.scale,minmax)%>%
+  unnest(minmax)%>%
+  filter(is.na(max.y))%>%
+  mutate(across(.cols=where(is.numeric),.fns=~lubridate::parse_date_time(as.character(floor(.)),orders="j")))
+
+## Build rectangles
+# Add two new rows for each row where upper < lower
+rect.tibble <- control.factors.mins %>%
+  mutate_if(is.POSIXct, as.Date) %>%  # Convert all date-time columns to date for easier comparison
+  filter(upper < lower) %>%
+  rowwise() %>%
+  do(bind_rows(., tibble(
+    cog.scale = .$cog.scale,
+    max.y = NA,
+    lower = as.Date("2024-01-01"),
+    upper = .$upper,
+    min.y = .$min.y
+  ), tibble(
+    cog.scale = .$cog.scale,
+    max.y = NA,
+    lower = .$lower,
+    upper = as.Date("2024-12-31"),
+    min.y = .$min.y
+  ))) %>%
+  ungroup() %>%
+  rbind(control.factors.mins)%>%
+  filter(upper>lower)%>%
+  mutate(ymin=as.numeric(factor(cog.scale))-.5,ymax=ymin+1)%>%
+  mutate_if(is.Date, as.POSIXct)
+
+# Plot rectangles
+Clinical.radial <- ggplot(rect.tibble,aes(y=cog.scale,
+                       x=min.y,
+                       xmin=lower,
+                       xmax=upper,
+                       ymin=ymin,
+                       ymax=ymax,
+                       fill=cog.scale,
+                       color=cog.scale))+
+  geom_rect(alpha=.25,color=NA)+
+  geom_point()+
+  scale_color_brewer(type = "qual",palette = "Set2",aesthetics = c("fill","colour"))+
+  scale_x_datetime(date_labels = "%B",
+                   limits = lubridate::parse_date_time(c("1","365"),orders="j"),
+                   date_breaks = "1 months")+
+  cowplot::theme_minimal_grid()+
+  theme(axis.text.x=element_text(hjust = 1,vjust = -2),
+        axis.title = element_blank(),
+        axis.line.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.spacing = unit(2, "lines"),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        plot.title = element_text(face = "plain"))+
+  coord_polar(start = -pi/365,clip = "off")+
+  ggtitle("Day of Minimum Performance")
+Clinical.radial
+
+# age radial
+newdata.9 =  expand_grid(interview_age=c(median(as.numeric(abcd.df$interview_age))), #,
+                       doy=1:365,
+                       ADHD_Status = c("Control","ADHD"), #,"ADHD"
+                       sex="M",
+                       visit_year = levels(adhd.df$visit_year)[1],
+                       weekdaynum=2,
+                       src_subject_id = levels(adhd.df$src_subject_id)[1])
+
+newdata.20 =  expand_grid(interview_age=20*12, #,
+                       doy=1:365,
+                       ADHD_Status = c("Control","ADHD"), #,"ADHD"
+                       sex="M",
+                       visit_year = levels(adhd.df$visit_year)[1],
+                       weekdaynum=2,
+                       src_subject_id = levels(adhd.df$src_subject_id)[1])
+model.df <- tibble(cog.scale = c("ADHD-1000 9.9y","ADHD-1000 20y"), newdata = c(list(newdata.9),list(newdata.20)))
+age.factors.mins.adhd1000 <- model.df %>% 
+  mutate(minmax = map(.x=newdata,.f=~gam.posterior.smooths.circular(pc.mod,
+                                                                  return_draws = FALSE,
+                                                                  smooth_var="doy",
+                                                                  newdata = .x,
+                                                                  cov_list=c("interview_age","ADHD_Status")))) %>%
+  unnest(minmax)%>%
+  select(cog.scale,minmax)%>%
+  unnest(minmax)%>%
+  filter(is.na(max.y))%>%
+  mutate(across(.cols=where(is.numeric),.fns=~lubridate::parse_date_time(as.character(floor(.)),orders="j")))
+
+## Build rectangles
+# Add two new rows for each row where upper < lower
+rect.tibble <- age.factors.mins.adhd1000 %>%
+  mutate_if(is.POSIXct, as.Date) %>%  # Convert all date-time columns to date for easier comparison
+  filter(upper < lower) %>%
+  rowwise() %>%
+  do(bind_rows(., tibble(
+    cog.scale = .$cog.scale,
+    max.y = NA,
+    lower = as.Date("2024-01-01"),
+    upper = .$upper,
+    min.y = .$min.y
+  ), tibble(
+    cog.scale = .$cog.scale,
+    max.y = NA,
+    lower = .$lower,
+    upper = as.Date("2024-12-31"),
+    min.y = .$min.y
+  ))) %>%
+  ungroup() %>%
+  rbind(age.factors.mins.adhd1000)%>%
+  filter(upper>lower)%>%
+  mutate(ymin=.5,ymax=1.5)%>%
+  mutate_if(is.Date, as.POSIXct)
+
+Age.radial <- ggplot(rect.tibble,aes(y=reorder(cog.scale,cog.scale,order=T,decreasing=F),
+                       x=min.y,
+                       xmin=lower,
+                       xmax=upper,
+                       ymin=ymin,
+                       ymax=ymax,
+                       fill=cog.scale,
+                       color=cog.scale))+
+  geom_rect(alpha=.25,color=NA,fill=dark_purples[2])+
+  geom_point(y=1,color=dark_purples[2])+
+  # scale_color_manual(aesthetics = c("fill","color"),
+  #                    values = dark_purples)+
+  scale_x_datetime(date_labels = "%B",
+                   # limits = lubridate::parse_date_time(c("1","365"),orders="j"),
+                   date_breaks = "1 months")+
+  cowplot::theme_minimal_grid()+
+  theme(axis.text.x=element_text(hjust = 1,vjust = -2),
+        axis.title = element_blank(),
+        axis.line.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.spacing = unit(2, "lines"),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        plot.title = element_text(face = "plain"))+
+  coord_polar(start = -pi/365,clip = "off")+
+  ggtitle("Day of Minimum Performance")+
+  facet_wrap(~cog.scale)
+Age.radial
+cowplot::save_plot('Figs/ADHD1000.radial.age.Overall.svg',Age.radial,base_asp = 1.5)
+
+```
+
+# GUSTO
+
+```{r}
+gusto.wasi <- fread('Data/GUSTO/GUSTO_cognitive_scores/GUSTO_WASI.csv')%>%
+  separate(col = "ID",into = c("site","subject-id",sep = "-"))%>%
+  select(!contains("Item"))%>%
+  filter(`WASI usability`=="usable")
+gusto.demographics <-fread('Data/GUSTO/GUSTO_cognitive_scores/GUSTO_demographics75.csv')%>%
+  mutate(across(.cols="subject-id",.fns=~str_remove(.x,pattern="GUSTO")))%>%
+  mutate(birthdate = as.Date(as.character(`date of birth`),format="%Y%m%d"))
+gusto.cantabswm <- fread('Data/GUSTO/GUSTO_cognitive_scores/GUSTO_Y06_CANTAB SWM_20190104.csv')%>%
+  separate(col = "SubjectID",into = c("site","subject-id",sep = "-"))
+gusto.cantabdms <- fread('Data/GUSTO/GUSTO_cognitive_scores/GUSTO_Y06_CANTAB DMS_20190104.csv')%>%
+  separate(col = "SubjectID",into = c("site","subject-id",sep = "-"))
+
+gusto.data.cantabswm <- left_join(gusto.demographics,gusto.cantabswm,by=c("subject-id"))%>%
+  mutate(age.in.days = SWM_Age_at_test_yr6*(365.25/12))%>% # convert age in months to days
+  mutate(int_date = birthdate+age.in.days)
+gusto.data.cantabdms <- left_join(gusto.demographics,gusto.cantabdms,by=c("subject-id"))%>%
+  mutate(age.in.days = DMS_Age_at_test_yr6*(365.25/12))%>% # convert age in months to days
+  mutate(int_date = birthdate+age.in.days)
+
+gusto.data <- left_join(gusto.wasi,gusto.demographics,by=c("subject-id"))
+# mutate variables 
+gusto.data <- gusto.data%>%
+  mutate(int_date=as.Date(`Date of administration`,format = "%Y-%m-%d"))%>%
+  mutate(weekday = weekdays(int_date))%>%
+  mutate(doy = yday(int_date))%>%
+  mutate(monthnum=month(int_date))%>%
+  mutate(sex=factor(sex,levels=c("M","F"),labels=c("M","F")),osex=ordered(sex))%>%
+  mutate(subid=factor(`subject-id`))%>%
+  left_join(weekdaykey)
+
+names(gusto.data)<-make.names(names(gusto.data))
+setDT(gusto.data)%>%
+  filter(!is.na(Matrix.Reasoning.t.score))
+gusto.data %>% 
+  gtsummary::tbl_summary(include = c(age,sex))
+
+gusto.data.cantabswm <- gusto.data.cantabswm%>%
+  mutate(weekday = weekdays(int_date))%>%
+  mutate(doy = yday(int_date))%>%
+  mutate(monthnum=month(int_date))%>%
+  mutate(sex=factor(sex,levels=c("M","F"),labels=c("M","F")),osex=ordered(sex))%>%
+  mutate(subid=factor(`subject-id`))%>%
+  left_join(weekdaykey)
+
+names(gusto.data.cantabswm)<-make.names(names(gusto.data.cantabswm))
+setDT(gusto.data.cantabswm)
+
+gusto.data.cantabdms <- gusto.data.cantabdms%>%
+  mutate(weekday = weekdays(int_date))%>%
+  mutate(doy = yday(int_date))%>%
+  mutate(monthnum=month(int_date))%>%
+  mutate(sex=factor(sex,levels=c("M","F"),labels=c("M","F")),osex=ordered(sex))%>%
+  mutate(subid=factor(`subject-id`))%>%
+  rename("DMS_A"=`DMS_A'_yr6`)%>%
+  rename("DMS_B" = `DMS_B''_yr6`)%>%
+  left_join(weekdaykey)
+
+names(gusto.data.cantabdms)<-make.names(names(gusto.data.cantabdms))
+setDT(gusto.data.cantabdms)
+```
+
+## GUSTO Cognitive scores
+
+Repeat the analysis for GUSTO data from Singapore.  
+I am conceptualizing this simply as evidence that Semptember is not universally the time of worst performance. This is evidence toward the idea of school year mattering.  
+
+### All WASI scores
+
+```{r}
+longdf <- gusto.data %>% pivot_longer(cols = contains("t.score")&!contains("Sum"),names_to = "cogtest",values_to = "score")
+
+model_output <- longdf %>%
+  group_by(cogtest) %>%
+  summarise(
+    model = list(bam(
+      score ~ s(age)+
+        s(weekdaynum, bs = "cc", k = 7)+
+        s(doy, bs = "cc", k = 52)+
+        sex, 
+      method = "REML")
+    ),
+    reduced_model = list(bam(score ~ s(age)+
+                               s(weekdaynum, bs = "cc", k = 7)+
+                               sex, method = "REML")))
+
+
+tidy_model <- model_output%>%
+  mutate(tidy = map(model, function(x) {
+  tidydf = broom::tidy(x)
+  tidydf$N = length(x$residuals)
+  tidydf
+})) %>%
+  unnest(tidy)%>%
+  select(-model,-reduced_model)%>%
+  filter(str_detect(term,"doy"))%>%
+  mutate(pfdr=p.adjust(p.value))%>%
+  relocate(N,.before = "edf")%>%
+  arrange(pfdr)
+tidy_model%>%kableExtra::kbl(escape = F)%>%kableExtra::kable_classic(html_font = "Cambria")
+
+r2_model <- model_output%>%
+  mutate(partialr2=map2(.x=model,.y=reduced_model,.f= ~partialR2(full_mod=.x,reduced_mod=.y))) %>%
+  unnest(partialr2)%>%
+  select(-model,-reduced_model)
+
+# Get partial predictions
+newdf <- with(gusto.data,expand_grid(age=median(age,na.rm = T),
+                                 doy=seq(from=1,to=365,by=.2),
+                                 weekdaynum=2,
+                              sex="M"))
+
+plot.data.gusto <-  model_output%>%
+  select(-reduced_model)%>%
+  mutate(plot.df = map(.x=model,
+                       .f=~ make.plot.df(.x,term = "doy",
+                                         newdata=newdf,add.intercept = TRUE)%>% 
+                         mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"))))%>%
+  unnest(plot.df) %>%
+  select(-model)
+
+
+gusto.wasi.mins <- model_output %>% 
+  mutate(minmax = map(.x=model,.f=~gam.posterior.smooths.circular(.x,return_draws = FALSE,smooth_var="doy"))) %>%
+  unnest(minmax)%>%
+  select(cogtest,minmax)%>%
+  unnest(minmax)%>%
+  filter(is.na(max.y))%>%
+  mutate(across(.cols=where(is.numeric),
+                .fns=~lubridate::parse_date_time(as.character(floor(.)),orders="j")))
+
+table.gusto <- left_join(tidy_model,r2_model)%>%
+  select(cogtest,N,edf,partialr2,p.value,pfdr)%>%
+  rename(Factor:=cogtest)
+# 
+gusto.results <- table.gusto %>%
+  mutate(matched_group = "GUSTO")%>%
+  relocate(matched_group)%>%
+  rename(Sample:=matched_group)
+```
+
+#### Plot WASI results
+
+```{r}
+# Line plot
+gusto.lines <- ggplot(plot.data.gusto,aes(x=doy.raw,y=fit,color=cogtest,fill=cogtest,ymin=lwr,ymax=upr))+
+  geom_ribbon(alpha=.25,color=NA)+
+  geom_line()+
+  scale_color_manual(values = brewer_pal(4, "Greens")(5)[c(3,5)],aesthetics = c("fill","color"))+
+  # scale_color_brewer(palette = "Greens",aesthetics = c("color","fill"))+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
+  theme(axis.text.x=element_text(angle=60,hjust = 1),
+        axis.title.x =  element_blank(),
+        legend.title = element_blank(),
+        legend.position = "top")+
+  ggtitle("GUSTO: WASI")+ylab("Performance (t-score)")
+gusto.lines
+cowplot::save_plot('Figs/gusto.lines.svg',gusto.lines)
+
+
+## Build rectangles
+# Add two new rows for each row where upper < lower
+rect.tibble <- gusto.wasi.mins %>%
+  mutate_if(is.POSIXct, as.Date) %>%  # Convert all date-time columns to date for easier comparison
+  filter(upper < lower) %>%
+  rowwise() %>%
+  do(bind_rows(., tibble(
+    cogtest = .$cogtest,
+    max.y = NA,
+    lower = as.Date("2024-01-01"),
+    upper = .$upper,
+    min.y = .$min.y
+  ), tibble(
+    cogtest = .$cogtest,
+    max.y = NA,
+    lower = .$lower,
+    upper = as.Date("2024-12-31"),
+    min.y = .$min.y
+  ))) %>%
+  ungroup() %>%
+  arrange(cogtest)%>%
+  filter(upper>lower)%>%
+  mutate(ymin=as.numeric(factor(cogtest))-.5,ymax=ymin+1)%>%
+  mutate_if(is.Date, as.POSIXct)
+
+# Plot rectangles
+gusto.radial<-ggplot(rect.tibble,aes(y=cogtest,
+                       x=min.y,
+                       xmin=lower,
+                       xmax=upper,
+                       ymin=ymin,
+                       ymax=ymax,
+                       fill=cogtest,
+                       color=cogtest))+
+  geom_rect(alpha=.25,color=NA)+
+  geom_point()+
+  scale_x_datetime(date_labels = "%B",date_breaks = "1 month")+
+  theme_minimal_grid()+
+  scale_color_manual(values = brewer_pal(4, "Greens")(5)[c(3,5)],aesthetics = c("fill","color"))+
+  theme(axis.text.x=element_text(hjust = 1),
+        axis.title = element_blank(),
+        axis.line = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major.y = element_blank(),
+        legend.position = "bottom",
+        legend.title = element_blank())+
+  coord_polar(start = -pi/365)+
+  ggtitle("Minimum Score")+theme(plot.title = element_text(face = "plain"))
+gusto.radial
+
+cowplot::save_plot('Figs/GUSTO.radial.svg',gusto.radial)
+```
+
+# Combined fig across datasets (GUSTO, PNC, ADHD1000 and ABCD)
+
+## Demographic table
+
+```{r}
+theme_gtsummary_journal(journal = "jama")
+demo.table <- bind_rows(
+  abcd.df%>% filter(!is.na(neurocog_pc1.bl))%>%select(age,sex,doy)%>%mutate(study="ABCD",age=age/30.4/12),
+  pnc%>%filter(!is.na(NAR_Overall_Efficiency))%>%select(age,sex,doy)%>%mutate(study="PNC",age=age/12),
+  adhd.df %>%mutate(study="ADHD-1000",age=interview_age/12)%>%select(age,sex,study,doy),
+  gusto.data%>%select(age,sex,doy)%>%mutate(study="GUSTO"))%>%
+  filter(!is.na(age)&!is.na(doy))%>%
+  mutate(ordered.study = ordered(study,levels=c("ABCD","PNC","ADHD-1000","GUSTO")),
+         sex = case_when(sex %in% c("Male","Female") ~ sex,
+                         sex=="M" ~ "Male",
+                         sex=="F" ~ "Female"))%>%
+  gtsummary::tbl_summary(include = c(age,sex),by = ordered.study,
+                         statistic = list(all_continuous() ~ "{mean} ({sd})"),
+                         label = list(age ~ "Age (y)", sex ~ "Sex"))%>%
+  modify_caption("Demographics")
+demo.table
+demo.table %>% as_gt()%>% gt::gtsave("./Tables/Demographics.Table.docx")
+
+all.results <- bind_rows(abcd.results,pnc.results,adhd.1000.results,gusto.results)
+all.results %>% kableExtra::kbl()
+write.table(all.results,file = "./Tables/AllDOYresults.csv",sep = ",",row.names = F)
+
+```
+
+## DOY densities
+Supplemental figure.  
+This figure shows the density of visit days across the year for each dataset. This is a way to visualize the distribution of visits across the year.  
+
+```{r}
+visit.times.by.dataset <- bind_rows(
+  abcd.df%>%select(age,sex,doy)%>%mutate(study="ABCD",age=age/12),
+  pnc%>%select(age,sex,doy)%>%mutate(study="PNC",age=age/12),
+  adhd.df%>%rename(age:=interview_age)%>%select(age,sex,doy)%>%mutate(study="ADHD-1000",age=age/12),
+  gusto.data%>%select(age,sex,doy)%>%mutate(study="GUSTO"))%>%
+  filter(!is.na(age))%>%
+  mutate(date_labels = lubridate::parse_date_time(as.character(floor(doy)),orders="j"))%>%
+  ggplot(aes(x=doy,color=study,fill=study))+
+  geom_density(alpha=.33)+
+  scale_color_manual(breaks = c("ABCD","PNC","ADHD-1000", "GUSTO"),
+                     values = c(brewer_pal(palette = "YlOrRd")(3)[3],
+                                brewer_pal(palette = "PuBu")(5)[5],
+                                brewer_pal(palette = "Purples")(5)[5],
+                                brewer_pal(palette = "Greens")(4)[4]),
+                     aesthetics = c("fill","color"))+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
+  theme(legend.title = element_blank(),axis.title.x = element_blank()) +
+  labs(y = "Visit density",
+       title = "Visit days by dataset")
+visit.times.by.dataset
+cowplot::save_plot('Figs/Supp.Visits.by.Dataset.svg',visit.times.by.dataset)
+
+
+```
+
+## Circle plots
+Figure 4.
+This figure shows the day of minimum performance for all datasets. 
+
+
+```{r}
+gusto.factors <- plot.data.gusto%>%
+  rename("Factor"=cogtest)%>%
+  mutate(study="GUSTO")
+abcd_factors <- plot.data.abcd%>%
+  mutate(study="ABCD")%>%select(colnames(gusto.factors))
+pnc_factors <- plot.data.pnc.all%>%
+  # mutate(study="PNC")%>%
+  # rbind(pnc_smooths.old%>%mutate(study="PNC Adult"))%>%
+  select(colnames(gusto.factors))
+adhd.factors <- adhd.plot.df.age%>%
+  filter(interview_age.raw  == 119)%>%
+  mutate(Factor = "Overall",study = "ADHD-1000")
+
+
+all_factors <- bind_rows(abcd_factors, pnc_factors, gusto.factors, adhd.factors) %>%
+  group_by(Factor, study) %>%
+  mutate(
+    scale_fit = as.numeric(scale(fit, center = TRUE)),
+    scale_lwr = as.numeric(scale(lwr, center = TRUE)),
+    scale_upr = as.numeric(scale(upr, center = TRUE))
+  ) %>%
+  # mutate(
+  #   scale_fit = (fit - min(fit)) / (max(fit) - min(fit))
+  # ) %>%
+  ungroup()
+
+# Plot lines
+all.factor.plot <- ggplot(all_factors%>%filter(!study == "PNC_20y"), aes(x = doy.raw, y = scale_fit, ymin = scale_lwr, ymax = scale_upr, color = study, fill = study,group = interaction(Factor,study))) + 
+  geom_ribbon(alpha = .1, color = NA) +
+  geom_line() +
+  # scale_color_brewer(type = "seq", palette = "Reds", direction = -1) +
+  # scale_fill_brewer(type = "seq", palette = "Reds", direction = -1) +
+  scale_color_manual(breaks = c("ABCD","PNC_9.9y", "ADHD-1000","GUSTO"),
+                     values = c(brewer_pal(palette = "Reds")(3)[3],
+                                brewer_pal(palette = "Blues")(5)[5],
+                                brewer_pal(palette = "Purples")(5)[5],
+                                brewer_pal(palette = "Greens")(4)[4]),
+                     aesthetics = c("fill","color"))+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
+  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+        axis.title.x = element_blank(),
+        legend.title = element_blank(),
+        legend.position = "top") +
+  labs(y = "Performance (scaled)",
+       title = "All cognitive factors")
+
+factor.mins <- bind_rows(
+  abcd.factors.mins%>%mutate(study="ABCD Total"),
+  abcd.factors.mins.splits%>%mutate(study=paste0("ABCD Split ", matched_group)),
+  pnc.factors.mins%>%mutate(study="PNC 9.9y"),
+  pnc.factors.mins.old%>%mutate(study="PNC 20y"),
+  age.factors.mins.adhd1000 %>% mutate(study= cog.scale) %>% rename("Factor"=cog.scale),
+  gusto.wasi.mins%>%rename("Factor"=cogtest)%>%mutate(study="GUSTO")
+)%>%
+  mutate(Factor_names = factor(Factor,
+                               levels = c("General Cognition",
+                                          "Executive Function",
+                                          "Learning/Memory",
+                                          "NAR_Overall_Efficiency",
+                                          "NAR_F1_Social_Cognition_Efficiency",
+                                          "NAR_F2_Complex_Reasoning_Efficiency",
+                                          "NAR_F3_Executive_Efficiency",
+                                          "NAR_F4_Memory_Efficiency",
+                                          "ADHD-1000 9.9y",
+                                          "ADHD-1000 20y",
+                                          "Block.Design.t.score",
+                                          "Matrix.Reasoning.t.score",
+                                          "Perceptual.reasoning.Sum.of.t.scores"), 
+                               labels = c("General Cognition",
+                                          "Executive Function",
+                                          "Learning/Memory",
+                                          "Overall",
+                                          "Social",
+                                          "Complex Reasoning",
+                                          "Executive",
+                                          "Memory",
+                                          "Overal Cognition (9.9y)",
+                                          "Overal Cognition (20y)",
+                                          "WASI Block",
+                                          "WASI Matrix",
+                                          "WASI Percept. Total"),ordered = TRUE))%>%
+  mutate(Factor = ifelse(study=="PNC 20y",paste("Adult",Factor_names),as.character(Factor_names)))
+  
+factor.mins.table <- factor.mins %>% select(study,Factor_names,min.y,lower,upper)%>%
+  rename("Cognitive_measure":=Factor_names,"Minimum":=min.y)%>%
+  mutate(across(c("Minimum","lower","upper"),~format(.,"%B %d")))%>%
+  unite("CI",c(lower,upper),sep = " - ")%>%mutate(CI = paste0("[",CI,"]"))
+write.table(factor.mins.table,file = "./Tables/AllFactorMins.csv",sep = ",",row.names = F)
+
+# ggplot(all_factors,aes(x=date_labels,y=scale_est,color=study,fill=study,group=interaction(Factor,study),ymin=lower,ymax=upper)) +
+#   geom_line()+
+#   ggtitle("")+
+#   scale_x_datetime(date_labels = "%B",limits = lubridate::parse_date_time(c("1","365"),orders="j"))+
+#   theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank())
+
+
+## Build rectangles
+# Add two new rows for each row where upper < lower
+rect.tibble <- factor.mins %>%
+  mutate_if(is.POSIXct, as.Date) %>%  # Convert all date-time columns to date for easier comparison
+  filter(upper < lower) %>%
+  rowwise() %>%
+  do(bind_rows(., tibble(
+    Factor = .$Factor,
+    max.y = NA,
+    lower = as.Date("2024-01-01"),
+    upper = .$upper,
+    min.y = .$min.y,
+    study = .$study,
+  ), tibble(
+    Factor = .$Factor,
+    max.y = NA,
+    lower = .$lower,
+    upper = as.Date("2024-12-31"),
+    min.y = .$min.y,
+    study = .$study
+  ))) %>%
+  ungroup() %>%
+  bind_rows(factor.mins)%>%
+  filter(upper>lower)%>%
+  mutate_if(is.Date, as.POSIXct)%>%
+  mutate(Factor.sorted = factor(Factor,levels=c("General Cognition","Executive Function","Learning/Memory",
+                                    "Overall","Complex Reasoning","Executive","Social","Memory",
+                                    "Overal Cognition (9.9y)",
+                                    "Adult Overall","Adult Complex Reasoning",
+                                    "Adult Executive","Adult Social","Adult Memory",
+                                    "Overal Cognition (19y)",
+                                    "WASI Block","WASI Matrix"),ordered = TRUE))%>%
+  
+  mutate(ymin=as.numeric(factor(Factor.sorted))-.5,ymax=ymin+1)
+
+# Plot rectangles
+all.studies.radial <- ggplot(rect.tibble,aes(y=Factor.sorted,
+                       x=min.y,
+                       xmin=lower,
+                       xmax=upper,
+                       ymin=ymin,
+                       ymax=ymax,
+                       fill=study,
+                       color=study,
+                       shape=study))+
+  geom_rect(alpha=.25,color=NA)+
+  geom_point()+
+  scale_color_manual(breaks = c("ABCD","PNC 9.9y", "ADHD-1000 9.9y", "PNC 20y", "ADHD-1000 19y", "GUSTO"),
+                     values = c(brewer_pal(palette = "Reds")(3)[3],
+                                brewer_pal(palette = "Blues")(5)[5],
+                                brewer_pal(palette = "Purples")(5)[5],
+                                brewer_pal(palette = "Blues")(5)[2],
+                                brewer_pal(palette = "Purples")(5)[3],
+                                brewer_pal(palette = "Greens")(4)[4]),
+                     aesthetics = c("fill","color"))+
+  scale_shape_manual(breaks = c("ABCD","PNC 9.9y", "ADHD-1000 9.9y", "PNC 20y", "ADHD-1000 19y", "GUSTO"),
+                     values = c(19,19,17,19,17,19))+
+  scale_x_datetime(date_labels = "%B",
+                   date_breaks = "1 month")+
+  theme_minimal_grid()+
+  theme(axis.text.x=element_text(hjust = 1),
+        axis.title = element_blank(),
+        axis.line = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major.y = element_blank(),
+        legend.position = "bottom",
+        legend.title = element_blank())+
+  coord_polar(start = -pi/365,clip = "off")+
+  ggtitle("Day of minimum performance")+theme(plot.title = element_text(face = "plain"))
+
+cowplot::save_plot('Figs/all.studies.radial.svg',all.studies.radial)
+all.studies.radial
+
+# School-aged kids only (age 9.9y)
+rect.tibble.9 <- rect.tibble %>% filter(!str_detect(Factor.sorted,"Adult")&!str_detect(Factor.sorted,"19y"))%>%mutate(ymin=as.numeric(factor(Factor.sorted))-.5,ymax=ymin+1)
+all.studies.radial.9 <- ggplot(rect.tibble.9,aes(y=Factor.sorted,
+                       x=min.y,
+                       xmin=lower,
+                       xmax=upper,
+                       ymin=ymin,
+                       ymax=ymax,
+                       fill=study,
+                       color=study,
+                       shape=study))+
+  geom_rect(alpha=.25,color=NA)+
+  geom_point()+
+  scale_color_manual(breaks = c("ABCD","PNC 9.9y", "ADHD-1000 9.9y","GUSTO"),
+                     values = c(brewer_pal(palette = "Reds")(3)[3],
+                                brewer_pal(palette = "Blues")(5)[5],
+                                brewer_pal(palette = "Purples")(5)[5],
+                                brewer_pal(palette = "Greens")(4)[4]),
+                     aesthetics = c("fill","color"))+
+  scale_shape_manual(breaks = c("ABCD","PNC 9.9y", "ADHD-1000 9.9y","GUSTO"),
+                     values = c(19,19,19,19))+
+  scale_x_datetime(date_labels = "%B",
+                   date_breaks = "1 month")+
+  theme_minimal_grid()+
+  theme(axis.text.x=element_text(hjust = 1),
+        axis.title = element_blank(),
+        axis.line = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major.y = element_blank(),
+        legend.position = "bottom",
+        legend.title = element_blank())+
+  coord_polar(start = -pi/365,clip = "off")+
+  ggtitle("Day of minimum performance for school-aged youth")+theme(plot.title = element_text(face = "plain"))
+all.studies.radial.9
+cowplot::save_plot('Figs/all.studies.radial.9.svg',all.studies.radial.9)
+```
+
+# Exposome
+
+Look at exposome relationships with doy and cognition.
+
+## ABCD
+
+### General exposome (factor 1).  
+
+Is there a day-of-year*SES interaction? (Is the day of year effect moderated by SES?)
+
+```{r exposome doy int}
+gmod.exposome <- bam(neurocog_pc1.bl~
+                       s(weekdaynum, bs = "cc", k = 7)+
+                       s(doy,bs = "cc", k = 52)+
+                       s(General_SES,k=4)+
+                       ti(doy,General_SES,k=c(52,4),bs=c("cc","ts"))+
+                       s(age)+
+                       s(doy, abcd_site, bs = "sz", xt = list(bs="cc"),k=13) +
+                       osex,
+                     data = abcd.df,REML = TRUE)
+# summary(gmod.exposome)
+tidy(gmod.exposome)
+# Plot
+newdata = with(gmod.exposome$model,expand.grid(weekdaynum=1,
+                                               doy=1:365,
+                                               General_SES = quantile(General_SES,c(.1,.9),na.rm = T),
+                                               osex="Male",
+                                               age=median(age),
+                                               abcd_site = 'site_04'))
+
+plot.data <-make.plot.df(gmod.exposome,term = "doy", newdata = newdata, int.term = "General_SES")%>%
+  mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"),
+         General_SES.label = factor(General_SES.raw,labels = c("Low (10%)","High (90%)")))
+
+abcd.exposome<-ggplot(plot.data,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr,linetype = General_SES.label))+
+  geom_ribbon(alpha=.25,color=NA)+
+  geom_line()+
+  scale_linetype_manual(values = c(2,1)) +
+  guides(linetype = guide_legend(title = "Exposome"))+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
+  theme(axis.text.x=element_text(angle=60,hjust = 1),
+        axis.title.x =  element_blank(),
+        legend.position = "top")+
+  ylab("General Cognition")+
+  ggtitle("ABCD")
+abcd.exposome
+
+plot.data2 <-make.plot.df(gmod.exposome,term = "doy", newdata = newdata)%>%
+  mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"))
+abcd.exposome.2<-ggplot(plot.data2,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr))+
+  geom_ribbon(alpha=.25,color=NA,fill = "#386cb0")+
+  geom_line(color = "#386cb0")+
+  # scale_color_brewer(type = "div",aesthetics = c("color","fill"))+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
+  theme(axis.text.x=element_text(angle=60,hjust = 1),
+        axis.title.x =  element_blank(),
+        legend.position = "top")+
+  ylab("General Cognition")+
+  ggtitle("ABCD")
+abcd.exposome.2
+
+cowplot::save_plot("Figs/SES.ABCD.svg",abcd.exposome)
+
+```
+
+### Does SES of participants relate to day of participation?
+
+```{r exposome doy}
+gmod.exposome <- bam(General_SES~
+                       s(weekdaynum, bs = "cc", k = 7)+
+                       s(doy,bs = "cc", k = 52)+
+                       s(neurocog_pc1.bl)+
+                       s(age)+
+                       s(doy, abcd_site, bs = "fs", xt = list(bs="cc", k=26)) +
+                       osex,
+                     data = abcd.df,REML = TRUE)
+summary(gmod.exposome)
+
+reduced.gmod.exposome <- bam(General_SES~
+                       s(weekdaynum, bs = "cc", k = 7)+
+                       s(neurocog_pc1.bl)+
+                       s(age)+
+                       s(abcd_site, bs = "re") +
+                       osex,
+                     data = abcd.df,REML = TRUE)
+
+partialR2(gmod.exposome,reduced.gmod.exposome)
+
+newdata = with(gmod.exposome$model,expand_grid(neurocog_pc1.bl=mean(neurocog_pc1.bl),doy=1:365,osex=levels(osex)[1],weekdaynum=2,abcd_site= "site04",age=median(age)))
+
+plot.data <- make.plot.df(gmod.exposome,term = "doy",add.intercept = TRUE,newdata = newdata)%>% 
+  mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"))
+
+exposome.doy <- ggplot(plot.data,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr))+
+  geom_ribbon(alpha=.25,color=NA, fill = "#f0027f")+
+  geom_line(color = "#f0027f")+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
+  scale_color_viridis_d(option = "inferno",aesthetics = c("fill","color"),begin = .6,end = .8)+
+  # scale_fill_viridis_d()+
+  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
+  ylab("Exposome")+ggtitle("ABCD")
+exposome.doy
+
+cowplot::save_plot("Figs/SES.ABCD.doy.svg",exposome.doy)
+```
+
+Does doy survive when covarying for exposome?
+
+```{r exposome doy cov ses}
+gmod.exposome.covses <- bam(neurocog_pc1.bl~
+                       s(weekdaynum, bs = "cc", k = 7)+
+                       s(doy,bs = "cc", k = 52)+
+                       s(General_SES)+
+                       s(age)+
+                       s(doy, abcd_site, bs = "fs", xt = list(bs="cc",k=26)) +
+                       osex,
+                     data = abcd.df,REML = TRUE)
+summary(gmod.exposome.covses)
+
+eta_squared(gmod.exposome.covses)
+effectsize::cohens_f_squared(gmod.exposome.covses)
+
+reduced.model <- bam(neurocog_pc1.bl~
+                       s(weekdaynum, bs = "cc", k = 7)+
+                       s(General_SES)+
+                       s(age)+
+                       s(abcd_site, bs = "re") +
+                       osex,
+                     data = abcd.df,REML = TRUE)
+
+reduced.model.SESeffect <- bam(neurocog_pc1.bl~
+                       s(weekdaynum, bs = "cc", k = 7)+
+                       s(doy,bs = "cc", k = 52)+
+                       s(age)+
+                       s(doy, abcd_site, bs = "fs", xt = list(bs="cc",k=26)) +
+                       osex,
+                     data = abcd.df,REML = TRUE)
+partialR2(gmod.exposome.covses,reduced.model)
+partialR2(gmod.exposome.covses,reduced.model.SESeffect)
+
+```
+
+#### Test general exposome with all cognitive factors and FDR
+```{r}
+long.exposome.abcd <- abcd.df %>% 
+  pivot_longer(cols=c("General_SES"),
+               names_to = "Exposome",values_to = "Exposome.value")%>%
+  pivot_longer(cols = contains("neurocog"),names_to = "cog.measure",values_to = "cog.score")
+
+model_output <- long.exposome.abcd %>%
+  group_by(Exposome, cog.measure) %>%
+  summarise(model = list(bam(cog.score ~
+                               s(weekdaynum, bs = "cc", k = 7) +
+                               s(doy, bs = "cc", k = 52) +
+                               s(Exposome.value, k = 4) +  # Use .x to refer to the Exposome.value within each group
+                               ti(doy, Exposome.value, k = c(52, 4), bs = c("cc", "ts")) +
+                               s(age, k = 4) +
+                               s(doy, abcd_site, bs = "sz", xt = list(bs="cc",k=26))  +
+                               osex,
+                             method = "fREML")))
+
+newdf <- with(abcd.df, expand.grid(weekdaynum=1,
+                                   doy=1:365,
+                                   Exposome.value = c(-1.6, 1.2),
+                                   osex="Male",
+                                   age=median(age),
+                                   abcd_site = 'site_04'))
+tidy_model <- model_output%>%
+  mutate(tidy = map(model, function(x) {
+    tidydf = broom::tidy(x)
+    tidydf$N = length(x$residuals)
+    tidydf
+  })) %>%
+  unnest(tidy)%>%
+  select(-model)%>%
+  filter(str_detect(term,"doy,Exposome.value"))%>%
+  mutate(pfdr=p.adjust(p.value))%>%
+  relocate(N,.before = "edf")%>%
+  arrange(pfdr)%>%
+  select(-ref.df,-statistic)
+tidy_model%>%kableExtra::kbl(escape = F)%>%kableExtra::kable_classic(html_font = "Cambria")
+
+model_output.general.poverty<-model_output%>%filter(Exposome %in% c("General_SES","Dense_Urban_Poverty"))
+
+plot.data <- model_output.general.poverty %>% 
+  mutate(plot.df = map(.x=model,
+                       .f=function(x) {
+                         newdf <- with(x$model, expand.grid(weekdaynum=1,
+                                                            doy=1:365,
+                                                            Exposome.value = quantile(Exposome.value,c(.1,.9),na.rm = T),
+                                                            osex="Male",
+                                                            age=median(age),
+                                                            abcd_site = 'site_04'))
+                         make.plot.df(x,term = "doy", newdata = newdf, int.term = "Exposome.value")%>%
+                           mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"),
+                                  Exposome.value.label = factor(Exposome.value.raw,labels = c("Low (10%)","High (90%)")))}))%>%
+  unnest(plot.df) %>%
+  select(-model)%>%
+  mutate(CogFactor = factor(cog.measure,levels=c("neurocog_pc1.bl","neurocog_pc2.bl","neurocog_pc3.bl"),labels=c("General Cognition", "Executive Function", "Learning/Memory")),
+         ExposomeFactor = factor(Exposome,levels=c("General_SES","Dense_Urban_Poverty"),labels=c("General Exposome", "Dense Urban Poverty")))%>%
+  tibble()
+
+ggplot(plot.data,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr,linetype = Exposome.value.label))+
+  geom_ribbon(alpha=.25,color=NA)+
+  geom_line()+
+  # scale_color_brewer(type = "div",aesthetics = c("color","fill"))+
+  scale_linetype_manual(values = c(2,1)) +
+  guides(linetype = guide_legend(title = "Exposome"))+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
+  theme(axis.text.x=element_text(angle=60,hjust = 1),
+        axis.title.x =  element_blank(),
+        legend.position = "top")+
+  ggtitle("ABCD")+
+  ylab("Exposomesome")+ facet_grid(~CogFactor,switch = "y",scales = "free",labeller = labeller(ExposomeFactor = label_wrap_gen(width = 12)))
+
+```
+
+## PNC exposome
+#### General exposome.  
+
+Is there a day-of-year*SES interaction? (Is the day of year effect moderated by SES?)
+In this case, since we know there is a doy-by-age  interaction, what we really want to know is whether the doy-by-age interaction depends on exposome.
+
+```{r pnc.exposome doy int}
+pnc$GeneralExposome <- pnc$GeneralAdversity*-1 #flipping sign to match ABCD
+gmod.exposome <- bam(NAR_Overall_Efficiency~
+                       s(weekdaynum, bs = "cc", k = 7)+
+                       s(doy,bs = "cc", k = 52)+
+                       s(GeneralExposome,k=4)+
+                       s(age)+
+                       ti(doy,GeneralExposome,k=c(52,4),bs=c("cc","ts"))+
+                       ti(doy,age,k=c(26,10),bs=c("cc","ts"))+
+                       ti(GeneralExposome,age,k=c(4,10))+
+                       ti(doy,GeneralExposome,age,k=c(26,4,10),bs=c("cc","ts","ts"))+
+                       osex,
+                     data = pnc,REML = TRUE)
+summary(gmod.exposome)# 3-way interaction is not significant
+
+# Get total doy effect after covarying for exposome
+reduced.model.pnc <- bam(NAR_Overall_Efficiency~
+                       s(weekdaynum, bs = "cc", k = 7)+
+                       s(GeneralExposome,k=4)+
+                       s(age)+
+                       ti(GeneralExposome,age,k=c(4,10))+
+                       osex,
+                     data = pnc,REML = TRUE) 
+pnc.doy.effect.with.exposome <- partialR2(gmod.exposome,reduced.model.pnc)
+
+newdf <- with(gmod.exposome$model, 
+              expand.grid(weekdaynum=1,
+                          doy=1:365,
+                          GeneralExposome = quantile(GeneralExposome,c(.1,.9),na.rm = T),
+                          osex="M",
+                          age=c(119)))
+plot.df <- make.plot.df(gmod.exposome,term = "doy",int.term = c("age","GeneralExposome"),add.intercept = TRUE,newdata = newdf)%>%
+  mutate(GeneralExposome.label = factor(GeneralExposome.raw,labels = c("Low (10%)","High (90%)")))
+
+pnc.exposome <- ggplot(plot.df,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr,linetype = GeneralExposome.label))+
+  geom_ribbon(alpha=.25,color=NA,fill="#386cb0")+
+  geom_line(color = "#386cb0")+
+  # scale_color_brewer(type = "div",aesthetics = c("color","fill"))+
+  scale_linetype_manual(values = c(2,1)) +
+  guides(linetype = guide_legend(title = "Exposome"))+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
+  theme(axis.text.x=element_text(angle=60,hjust = 1),
+        axis.title.x =  element_blank(),
+        legend.position = "top")+
+  ylab("General Cognition")+
+  ggtitle("PNC at median age of ABCD (9.9y)")
+
+plot.df2 <- make.plot.df(gmod.exposome,term = "doy",add.intercept = TRUE,newdata = newdf)
+pnc.exposome2 <- ggplot(plot.df2,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr))+
+  geom_ribbon(alpha=.25,color=NA,fill="#386cb0")+
+  geom_line(color = "#386cb0")+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
+  theme(axis.text.x=element_text(angle=60,hjust = 1),
+        axis.title.x =  element_blank(),
+        legend.position = "top")+
+  ylab("General Cognition")+
+  ggtitle("PNC at median age of ABCD (9.9y)")
+
+pnc.exposome
+cowplot::save_plot("Figs/SES.PNC.svg",pnc.exposome)
+```
+
+#### Does participation date vary by general adversity? 
+```{r}
+adversity.doy <- bam(GeneralExposome~
+                       s(weekdaynum, bs = "cc", k = 7)+
+                       ti(doy,age,k=c(26,10),bs=c("cc","ts"))+
+                       s(doy,bs = "cc", k = 52)+
+                       s(age)+
+                       osex,
+                     data = pnc,REML = TRUE)
+summary(adversity.doy)
+
+reduced.model <- bam(GeneralExposome~
+                       s(weekdaynum, bs = "cc", k = 7)+
+                       s(age)+
+                       osex,
+                     data = pnc,REML = TRUE)
+adversity.effect <- partialR2(adversity.doy,reduced.model)
+
+newdata = with(adversity.doy$model,expand_grid(doy=1:365,osex=levels(osex)[1],weekdaynum=2,age=9.9*12))
+
+plot.data <- make.plot.df(adversity.doy,term = "doy",int.term = "age",add.intercept = TRUE,newdata = newdata)%>% 
+  mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"))
+
+adversity.doy.plot <- ggplot(plot.data,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr))+
+  geom_ribbon(alpha=.25,color=NA,fill="#f0027f")+
+  geom_line(color = "#f0027f")+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
+  scale_color_viridis_d(option = "inferno",aesthetics = c("fill","color"),begin = .6,end = .8)+
+  # scale_fill_viridis_d()+
+  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
+  ylab("Exposome")+ggtitle("PNC at median age of ABCD (9.9y)")
+adversity.doy.plot
+
+visualize_model(adversity.doy,smooth_var = "doy",int_var = "age",show.data = FALSE)
+visualize_model(adversity.doy,smooth_var = "weekdaynum",int_var = "age",show.data = FALSE)
+
+doy.exposome.plot <- exposome.doy + adversity.doy.plot
+cowplot::save_plot('Figs/ExposomeParticipantion.svg',doy.exposome.plot,base_width = 8)
+
+```
+
+
+#### All cognitive factors
+```{r}
+long.exposome <- pnc %>% 
+  pivot_longer(cols=c("GeneralExposome"),names_to = "Exposome",values_to = "Exposome.value")%>%
+  pivot_longer(cols = contains("Effici"),names_to = "Factor",values_to = "Score")%>%
+   mutate(Factor = factor(Factor,levels = c("NAR_Overall_Efficiency","NAR_F1_Social_Cognition_Efficiency","NAR_F2_Complex_Reasoning_Efficiency","NAR_F3_Executive_Efficiency","NAR_F4_Memory_Efficiency"), labels = c("Overall","Social","Complex","Executive","Memory")))
+
+model_output <- long.exposome %>%
+  group_by(Exposome,Factor) %>%
+  summarise(model = list(bam(Score~
+                               s(weekdaynum, bs = "cc", k = 7)+
+                               s(doy,bs = "cc", k = 52)+
+                               s(Exposome.value,k=4)+
+                               ti(doy,Exposome.value,k=c(26,4),bs=c("cc","ts"))+
+                               s(age,k=10)+
+                               ti(doy,age,k=c(26,10),bs=c("cc","ts"))+
+                               ti(Exposome.value,age)+
+                               ti(doy,Exposome.value,age,k=c(26,4,10),bs=c("cc","ts","ts"))+
+                               osex,
+                             method = "fREML", discrete = TRUE)))
+
+plot.data <- model_output %>% 
+  mutate(plot.df = map(.x=model,
+                       .f=function(x) {
+                         newdf <- with(x$model, expand.grid(weekdaynum=1,
+                                                            doy=1:365,
+                                                            Exposome.value = quantile(Exposome.value,c(.1,.9),na.rm = T),
+                                                            osex="M",
+                                                            age=c(119)))
+                         make.plot.df(x,term = "doy",int.term = c("age","Exposome.value"),add.intercept = TRUE,newdata = newdf)%>%
+                           mutate(Exposome.value.label = factor(Exposome.value.raw,labels = c("Low (10%)","High (90%)")))}))%>%
+  unnest(plot.df) %>%
+  select(-model)%>%
+  mutate(ExposomeFactor = factor(Exposome,levels=c("GeneralExposome"),labels=c("Exposome")))%>%
+  tibble()
+
+ggplot(plot.data,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr,linetype = Exposome.value.label))+
+  geom_ribbon(alpha=.25,color=NA)+
+  geom_line()+
+  # scale_color_brewer(type = "div",aesthetics = c("color","fill"))+
+  scale_linetype_manual(values = c(2,1)) +
+  guides(linetype = guide_legend(title = "Exposome"))+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
+  theme(axis.text.x=element_text(angle=60,hjust = 1),
+        axis.title.x =  element_blank(),
+        legend.position = "top")+
+  ggtitle("PNC: Median age of ABCD (9.9y)")+
+  ylab("Exposome")+ facet_grid(~Factor,switch = "y",scales = "free",labeller = labeller(ExposomeFactor = label_wrap_gen(width = 12)))
+
+
+tidy_model <- model_output%>%
+  mutate(tidy = map(model, broom::tidy)) %>%
+  unnest(tidy)%>%
+  select(-model)%>%
+  filter(str_detect(term,"age,Exposome.value,doy"))%>%
+  mutate(pfdr=p.adjust(p.value))%>%
+  arrange(p.value)
+tidy_model%>%kableExtra::kbl(escape = F)%>%kableExtra::kable_classic(html_font = "Cambria")
+
+
+gmod.exposome2 <- bam(NAR_F3_Executive_Efficiency~
+                        s(weekdaynum, bs = "cc", k = 7)+
+                        s(doy,bs = "cc", k = 52)+
+                        s(GeneralExposome,k=4)+
+                        ti(doy,GeneralExposome,k=c(26,4),bs=c("cc","ts"))+
+                        s(age,k=10)+
+                        ti(doy,age,k=c(26,10),bs=c("cc","ts"))+
+                        ti(GeneralExposome,age)+
+                        ti(doy,GeneralExposome,age,k=c(26,4,10),bs=c("cc","ts","ts"))+
+                        osex,
+                      data = pnc,method="fREML",discrete = TRUE)
+summary(gmod.exposome2)
+draw(gmod.exposome2,select = "age,GeneralExposome,doy",partial_match = T)
+visualize_model(gmod.exposome2,smooth_var = "doy",int_var = "GeneralExposome",show.data = F,quants = c(.25,.75))
+
+newdata = with(gmod.exposome2$model,expand_grid(doy=1:365,osex=levels(osex)[1],weekdaynum=2,age=c(9.9*12,20*12),GeneralExposome = quantile(GeneralExposome,c(.1,.9))))
+
+plot.data <- make.plot.df(gmod.exposome2,term = "doy",int.term = c("age","GeneralExposome"),add.intercept = TRUE,newdata = newdata)%>% 
+  mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"))
+
+ggplot(plot.data,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr,linetype = factor(GeneralExposome.raw)))+
+  geom_ribbon(alpha=.25,color=NA)+
+  geom_line(size=1.5)+
+  scale_linetype_manual(values = c(2,1))+
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
+  scale_color_viridis_d(option = "inferno",aesthetics = c("fill","color"),begin = .6,end = .8)+
+  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
+  ylab("Performance")+ggtitle("PNC") + facet_grid(~age.raw)
+
+```
+
+## Generate Figure 5
+
+```{r}
+(exposome.doy + adversity.doy.plot+plot_layout(axis_titles = "collect"))/(abcd.exposome+pnc.exposome+plot_layout(axis_titles = "collect_y"))
+
+participation.effect <- exposome.doy + adversity.doy.plot+plot_layout(axis_titles = "collect")+
+  plot_annotation(title = "Study participation")
+
+cognition.effect.interaction <- abcd.exposome+pnc.exposome + plot_layout(axis_titles = "collect",guides = "collect") + plot_annotation(title = "Performance") & theme(legend.position='top') 
+
+cognition.effect <- abcd.exposome.2+pnc.exposome2 + plot_layout(axis_titles = "collect",guides = "collect") + plot_annotation(title = "Performance") & theme(legend.position='top') 
+
+combined.exosome.plot <- (participation.effect /
+cognition.effect)
+combined.exosome.plot
+
+# exposome.doy + adversity.doy.plot + abcd.exposome+pnc.exposome + plot_layout(nrow = 2,axis_titles = "collect",guides = "collect")
+cowplot::save_plot('Figs/Fig5.Exposomes.svg',combined.exosome.plot,base_width = 8, base_height = 6)
+```
+
