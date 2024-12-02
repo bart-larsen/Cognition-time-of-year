@@ -205,9 +205,12 @@ vignettes/*.pdf
 .Renviron
 
 # Data directories that are not public
-Data/ABCD/
-Data/GUSTO/
-Data/ADHD1000
+Data/ABCD/*
+Data/GUSTO/*
+Data/ADHD1000/*
+
+# Keep ADHD data not on NDA
+!Data/ADHD1000/interview.dates.and.dx.csv
 
 # Figs do not need to be uploaded.
 Figs/*
