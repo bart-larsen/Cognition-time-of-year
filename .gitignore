@@ -208,3 +208,6 @@ vignettes/*.pdf
 Data/ABCD/
 Data/GUSTO/
 Data/ADHD1000
+
+# Figs do not need to be uploaded.
+Figs/*
