@@ -25,7 +25,7 @@ library(gt)
 
 source("Tools/GAMM_plotting2.R")
 source("Tools/GAM_Effects.R")
-source("~/Library/CloudStorage/Box-Box/Work/PennLINC/Code/Tools/GAM_Posterior_circular_min_max.R")
+source("Tools/GAM_Posterior_circular_min_max.R")
 source("Tools/Partial.Residual.Plot.R")
 knitr::opts_chunk$set(warning = FALSE,echo=FALSE,message = FALSE)
 theme_set(theme_classic(base_size = 16) +
@@ -38,6 +38,11 @@ theme_set(theme_classic(base_size = 16) +
               legend.title = element_text(size = 16, color = "black")
             )
 )
+#Get Day of Week
+weekdaykey<-data.frame(weekday=
+                         c("Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday","Monday"),
+                       weekdaynum=
+                         c(1,2,3,4,5,6,7))
 ```
 
 
@@ -142,26 +147,11 @@ doy_to_month <- function(doy) {
 # ABCD Data
 
 ```{r load data, echo = FALSE, }
-abcd.names<-fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/ABCD/ABCD_pull/abcd_tabulated_data-20230412/abcd_tbss01.txt',,na.strings = c("777"))
-abcd<-fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/ABCD/ABCD_pull/abcd_tabulated_data-20230412/abcd_tbss01.txt',,na.strings = c("777"),skip = 2)
-names(abcd)=names(abcd.names)
+# Load ABCD data
+abcd.input <- fread("Data/ABCD/abcdy1.csv")
 
-factorscores <- readRDS('~/Box/Work/UMN/Projects/Cognition_TOY/Data/ABCD/DEAP-data-download_ThompsonScores_ResFamIncome.rds')%>%
-  filter(event_name=="baseline_year_1_arm_1")
-
-exosomes <- fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/ABCD/abcd_longitudinal_factor_scores_7f_bifactor.csv')%>%
-  mutate(eventname=Timepoint,src_subject_id=ID)
-
-abcdy1 <- abcd %>% filter(eventname=="baseline_year_1_arm_1")%>%
-  left_join(factorscores)%>%
-  left_join(exosomes)
-#Get Day of Week
-weekdaykey<-data.frame(weekday=
-                         c("Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday","Monday"),
-                       weekdaynum=
-                         c(1,2,3,4,5,6,7))
 # mutate variables 
-abcdy1 <- abcdy1%>%
+abcd.data <- abcd.input%>%
   mutate(int_date=as.Date(interview_date,format = "%m/%d/%Y"))%>%
   mutate(visit_rank = rank(interview_date))%>%
   mutate(weekday = weekdays(int_date))%>%
@@ -169,29 +159,27 @@ abcdy1 <- abcdy1%>%
   mutate(doy = yday(int_date))%>%
   mutate(age = as.numeric(interview_age)*30.4375, #age in days
          sex=factor(sex,levels=c("M","F"),labels = c("Male","Female")),
-         osex=ordered(sex))%>%
+         osex=ordered(sex),
+         race = factor(race.6level))%>%
   left_join(weekdaykey)%>%
   mutate(across(contains("uncorrected"), as.numeric))
-setDT(abcdy1)
+setDT(abcd.data)
 
 # Get participants data split
 ## The important column is "matched_group".
 participants <- fread('Data/ABCD/participants_v1.0.3/participants.tsv',sep = "\t")%>%
   mutate(session_id=tolower(session_id))
-abcd.df <- abcdy1 %>%
+abcd.df <- abcd.data %>%
   mutate(participant_id = sub(replacement = "",pattern="_",x = paste0("sub-",src_subject_id),fixed=TRUE),
          session_id = gsub(replacement = "", pattern = "_", x = paste0("ses-",eventname),fixed=TRUE))%>%
   left_join(participants,by=c("participant_id", "session_id"),suffix = c("","y"))
 
-# Get site (this is now included with participants.tsv)
-site <- readRDS("~/Box/Work/UMN/Projects/Cognition_TOY/Data/ABCD/DEAP-siteID.rds")%>% filter(event_name=="baseline_year_1_arm_1")
-
-abcd.df <- abcd.df %>% left_join(site)%>%
+abcd.df <- abcd.df %>% 
   mutate(rel_family_id=factor(rel_family_id),
          src_subject_id=factor(src_subject_id),
          eventname = factor(eventname))
 
-remove(abcd.cbcl.names,abcd.names,exosomes,factorscores,screen.time,screen.time.names,site,abcdy1,participants,abcd)
+remove(abcd.data, participants, abcd.input)
 ```
 
 ## All ABCD factors
@@ -1469,19 +1457,10 @@ Analyses for the PNC data.
 The difference between this analysis and the ABCD analysis is that we included an age*ToY interaction to allow the ToY effect to vary across the age range.  
 
 ```{r data}
-task_data_ar <- fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/PNC/go1_go2_go3_pnc_cnb_zscores_frar_20170202_wdates.csv')
-task_data_nr <- fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/PNC/n9498_cnb_zscores_fr_20170202.csv')
-task_data_factor <- fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/PNC/n9498_cnb_factor_scores_fr_20170202.csv')
-demos <- fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/PNC/n9498_demographics_go1_20161212.csv')
-pnc.exposome <- fread('~/Box/Work/UMN/Projects/Cognition_TOY/Data/PNC/PNC_exposome_bifactor_expandedENV.csv')%>%
-  mutate(bblid=ID)
-
-task_data <- left_join(task_data_factor,task_data_nr)%>%
-  left_join(task_data_ar)%>%
-  left_join(demos)%>%
-  left_join(pnc.exposome)
+# Load the PNC data
+pnc <- fread("Data/PNC/pnc_data.csv")
 # mutate variables 
-pnc <- task_data%>%
+pnc <- pnc%>%
   mutate(int_date=as.Date(cnbDate,format = "%m/%d/%Y"))%>%
   mutate(weekday = weekdays(int_date))%>%
   mutate(doy = yday(int_date))%>%
@@ -1489,7 +1468,7 @@ pnc <- task_data%>%
   mutate(age = as.numeric(cnbAgeMonths))%>%
   mutate(sex=factor(sex,levels=c(1,2),labels=c("M","F")),osex=ordered(sex))%>%
   mutate(subid=factor(bblid))%>%
-  mutate(race.factor=factor(race, levels = 1:6,labels=levels(abcd.df$race.6level)))%>%
+  mutate(race.factor=factor(race, levels = 1:6,labels=levels(abcd.df$race)))%>%
   left_join(weekdaykey)%>%
   filter(!is.na(NAR_Overall_Accuracy)&!is.na(age))
 setDT(pnc)
