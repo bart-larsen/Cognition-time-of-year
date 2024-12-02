@@ -38,7 +38,7 @@ theme_set(theme_classic(base_size = 16) +
               legend.title = element_text(size = 16, color = "black")
             )
 )
-#Get Day of Week
+# Define days of week for later use.
 weekdaykey<-data.frame(weekday=
                          c("Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday","Monday"),
                        weekdaynum=
@@ -1793,31 +1793,10 @@ cowplot::save_plot('Figs/PNC.lines.all.svg',pnc.lines.old.young,base_asp = .88,b
 # ADHD 1000
 
 ```{r}
-interview.dates <- fread('Data/ADHD1000/Visit_dates.csv',sep = ",",na.strings = "\n")
-interview.dates <- read.csv('Data/ADHD1000/Visit_dates.csv',sep = ",",na.strings = " ") %>% mutate(across(contains("Date"),~as.Date(.x,format="%m/%d/%y")))
-long.interview.dates <- interview.dates %>% 
-  select(Mergeid,contains("Date"))%>%
-  pivot_longer(cols = contains("Date"),names_to = "VisitLabel",values_to = "interview.date")%>%
-  filter(!VisitLabel%in%c("V1_Date","Decision_Date"))%>%
-  mutate(interview.year = year(interview.date),
-         src_subject_id = factor(Mergeid))%>%
-  mutate(VisitLabel = if_else(VisitLabel=="V2_Date","Y1",str_remove(VisitLabel, "_.*")))
-
-# Prs stuff
-prs.df <- fread('Data/ADHD1000/Oregon-ADHD-1000_imaging_demo_pheno_prs.csv',sep = ",")%>%
-  mutate(src_subject_id = factor(MERGEID))
-adhd.scores <- fread('Data/ADHD1000/OHSU_earliest_visit.csv',sep = ",")
-
-# DTeam dx
-dx.df <- fread('Data/ADHD1000/CleanY1-Y13Dteam.csv',sep = ",")
-long.dx.df <- dx.df %>%
-  select(Mergeid, matches("^Y([1-9]|1[0-3])_Adhd_Status$"))%>%
-  pivot_longer(cols = contains("Adhd_Status"),names_to = "VisitLabel",values_to = "Status") %>%
-  mutate(VisitLabel = str_remove(VisitLabel, "_Adhd_Status"))
-
-# Join DTeam and interview dates
-long.interview.dates <- long.interview.dates %>%
-  left_join(long.dx.df)
+# Load ADHD 1000 interview doy and dx category
+adhd1000 <- fread("Data/ADHD1000/doy.and.dx.csv")%>%
+  left_join(weekdaykey)%>%
+  mutate(src_subject_id=factor(src_subject_id))
 
 # CPT (vars: dprime1	dprime2	cbiasc	cbiass	lnb_c	lnb_s)
 CPT.names <- fread('Data/ADHD1000/nonimaging_data/collection2857/cpth01.txt')
@@ -1936,20 +1915,13 @@ adhd.cog.scores <- ADHD.dkefs %>%
   ungroup()
 
 adhd.cog.scores.dates <- adhd.cog.scores %>% 
-  full_join(long.interview.dates%>%
-              mutate(visit_year = as.numeric(str_extract(VisitLabel, "\\d+"))),by = c("visit_year", "src_subject_id")) %>%
-  mutate(weekday = weekdays(interview.date),
-         doy = yday(interview.date))%>%
-  left_join(weekdaykey)
+  full_join(adhd1000%>%
+              mutate(visit_year = as.numeric(str_extract(VisitLabel, "\\d+"))),by = c("visit_year", "src_subject_id")) 
 
-adhd.clin <- prs.df %>%
-  left_join(adhd.scores)
 adhd.df <- adhd.cog.scores.dates%>%
-  left_join(adhd.clin,by = c("visit_year"="YEAR","src_subject_id"))%>%
-  mutate(Y1_ADHD_STATUS = factor(Y1_ADHD_STATUS),
-         sex = factor(sex),
-         visit_year = ordered(visit_year),
-         race.factor=factor(CHILD_RACE1, levels = 1:6,labels=levels(abcd.df$race.6level)))%>%
+  mutate(sex = factor(sex),
+         visit_year = ordered(visit_year)) %>%
+         # race.factor=factor(CHILD_RACE1, levels = 1:6,labels=levels(abcd.df$race.6level)))%>%
   filter(Status %in% c(1,3))%>%
   filter(!is.na(x = interview_age))%>%
   mutate(ADHD_Status = factor(Status, levels = c(1,3),labels = c("Control","ADHD")),
@@ -1957,20 +1929,20 @@ adhd.df <- adhd.cog.scores.dates%>%
          CPT.dprime = (dprime1+dprime2)/2)
 
 # Create DKEFS residual variables
-cw.mod <- lme4::lmer(dkefs_colorword3_scaled ~ dkefs_colorword1_scaled + dkefs_colorword2_scaled + visit_year + (1|src_subject_id),data = adhd.df)
-cw.resid <- resid(cw.mod)
-cw.df <- cw.mod@frame
-cw.df$dkefs_colorword3_residuals <- cw.resid
+# cw.mod <- lme4::lmer(dkefs_colorword3_scaled ~ dkefs_colorword1_scaled + dkefs_colorword2_scaled + visit_year + (1|src_subject_id),data = adhd.df)
+# cw.resid <- resid(cw.mod)
+# cw.df <- cw.mod@frame
+# cw.df$dkefs_colorword3_residuals <- cw.resid
 
-trails.mod <- lme4::lmer(dkefs_trail4_scaled ~ dkefs_trail2_scaled + dkefs_trail3_scaled + visit_year +(1|src_subject_id),data = adhd.df)
-trails.resid <- resid(trails.mod)
-trails.df <- trails.mod@frame%>%
-  mutate(visit_year = ordered(visit_year,levels = levels(cw.df$visit_year)))
-trails.df$dkefs_trails4_residuals <- trails.resid
+# trails.mod <- lme4::lmer(dkefs_trail4_scaled ~ dkefs_trail2_scaled + dkefs_trail3_scaled + visit_year +(1|src_subject_id),data = adhd.df)
+# trails.resid <- resid(trails.mod)
+# trails.df <- trails.mod@frame%>%
+#   mutate(visit_year = ordered(visit_year,levels = levels(cw.df$visit_year)))
+# trails.df$dkefs_trails4_residuals <- trails.resid
 
 adhd.df <- adhd.df %>% 
-  left_join(cw.df %>% select(dkefs_colorword3_residuals,src_subject_id,visit_year))%>% 
-  left_join(trails.df %>% select(dkefs_trails4_residuals,src_subject_id,visit_year))%>%
+  # left_join(cw.df %>% select(dkefs_colorword3_residuals,src_subject_id,visit_year))%>% 
+  # left_join(trails.df %>% select(dkefs_trails4_residuals,src_subject_id,visit_year))%>%
   filter(!is.na(interview_age))%>%
   filter(if_any(c(dkefs_colorword3_raw, dkefs_trail4_raw, n1backacc, 
                   n2backacc, ssbk_numcomplete, stop_mrt_int, dprime1), 
@@ -2602,32 +2574,9 @@ cowplot::save_plot('Figs/ADHD1000.radial.age.Overall.svg',Age.radial,base_asp = 
 # GUSTO
 
 ```{r}
-gusto.wasi <- fread('Data/GUSTO/GUSTO_cognitive_scores/GUSTO_WASI.csv')%>%
-  separate(col = "ID",into = c("site","subject-id",sep = "-"))%>%
-  select(!contains("Item"))%>%
-  filter(`WASI usability`=="usable")
-gusto.demographics <-fread('Data/GUSTO/GUSTO_cognitive_scores/GUSTO_demographics75.csv')%>%
-  mutate(across(.cols="subject-id",.fns=~str_remove(.x,pattern="GUSTO")))%>%
-  mutate(birthdate = as.Date(as.character(`date of birth`),format="%Y%m%d"))
-gusto.cantabswm <- fread('Data/GUSTO/GUSTO_cognitive_scores/GUSTO_Y06_CANTAB SWM_20190104.csv')%>%
-  separate(col = "SubjectID",into = c("site","subject-id",sep = "-"))
-gusto.cantabdms <- fread('Data/GUSTO/GUSTO_cognitive_scores/GUSTO_Y06_CANTAB DMS_20190104.csv')%>%
-  separate(col = "SubjectID",into = c("site","subject-id",sep = "-"))
-
-gusto.data.cantabswm <- left_join(gusto.demographics,gusto.cantabswm,by=c("subject-id"))%>%
-  mutate(age.in.days = SWM_Age_at_test_yr6*(365.25/12))%>% # convert age in months to days
-  mutate(int_date = birthdate+age.in.days)
-gusto.data.cantabdms <- left_join(gusto.demographics,gusto.cantabdms,by=c("subject-id"))%>%
-  mutate(age.in.days = DMS_Age_at_test_yr6*(365.25/12))%>% # convert age in months to days
-  mutate(int_date = birthdate+age.in.days)
-
-gusto.data <- left_join(gusto.wasi,gusto.demographics,by=c("subject-id"))
-# mutate variables 
+# Load GUSTO data
+gusto.data <- fread("Data/GUSTO/gusto.data.csv")
 gusto.data <- gusto.data%>%
-  mutate(int_date=as.Date(`Date of administration`,format = "%Y-%m-%d"))%>%
-  mutate(weekday = weekdays(int_date))%>%
-  mutate(doy = yday(int_date))%>%
-  mutate(monthnum=month(int_date))%>%
   mutate(sex=factor(sex,levels=c("M","F"),labels=c("M","F")),osex=ordered(sex))%>%
   mutate(subid=factor(`subject-id`))%>%
   left_join(weekdaykey)
@@ -2637,30 +2586,6 @@ setDT(gusto.data)%>%
   filter(!is.na(Matrix.Reasoning.t.score))
 gusto.data %>% 
   gtsummary::tbl_summary(include = c(age,sex))
-
-gusto.data.cantabswm <- gusto.data.cantabswm%>%
-  mutate(weekday = weekdays(int_date))%>%
-  mutate(doy = yday(int_date))%>%
-  mutate(monthnum=month(int_date))%>%
-  mutate(sex=factor(sex,levels=c("M","F"),labels=c("M","F")),osex=ordered(sex))%>%
-  mutate(subid=factor(`subject-id`))%>%
-  left_join(weekdaykey)
-
-names(gusto.data.cantabswm)<-make.names(names(gusto.data.cantabswm))
-setDT(gusto.data.cantabswm)
-
-gusto.data.cantabdms <- gusto.data.cantabdms%>%
-  mutate(weekday = weekdays(int_date))%>%
-  mutate(doy = yday(int_date))%>%
-  mutate(monthnum=month(int_date))%>%
-  mutate(sex=factor(sex,levels=c("M","F"),labels=c("M","F")),osex=ordered(sex))%>%
-  mutate(subid=factor(`subject-id`))%>%
-  rename("DMS_A"=`DMS_A'_yr6`)%>%
-  rename("DMS_B" = `DMS_B''_yr6`)%>%
-  left_join(weekdaykey)
-
-names(gusto.data.cantabdms)<-make.names(names(gusto.data.cantabdms))
-setDT(gusto.data.cantabdms)
 ```
 
 ## GUSTO Cognitive scores

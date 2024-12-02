@@ -210,7 +210,7 @@ Data/GUSTO/*
 Data/ADHD1000/*
 
 # Keep ADHD data not on NDA
-!Data/ADHD1000/interview.dates.and.dx.csv
+!Data/ADHD1000/doy.and.dx.csv
 
 # Figs do not need to be uploaded.
 Figs/*
