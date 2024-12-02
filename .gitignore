@@ -203,3 +203,8 @@ vignettes/*.pdf
 
 # R Environment Variables
 .Renviron
+
+# Data directories that are not public
+Data/ABCD/
+Data/GUSTO/
+Data/ADHD1000
