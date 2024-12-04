@@ -133,6 +133,75 @@ circular_posterior_analysis <- function(predicted.smooth.values, make_plot = FAL
   return(mci)
 }
 
+
+make.plot.df <- function(modobj,term,int.term=NULL,group.term=NULL,add.intercept=FALSE,xlabel=NULL,ylabel=NULL,plot.title = NULL,show.data=TRUE,newdata=NULL){
+  terms=c(term,int.term)
+  
+  # Check the model
+  if (any(class(modobj)=="gam")) {
+    modobj <- modobj
+  } else if (class(modobj$gam)=="gam") {
+    modobj <- modobj$gam
+  } else {
+    stop("Can't find a gam object")
+  }
+
+  model_terms <- term_names(modobj)
+
+  df <- modobj$model%>%select(model_terms)
+  mod.intercept <- modobj$coefficients["(Intercept)"]
+  if (is.null(newdata)) {
+    pterms <- predict(modobj,type = "terms",se.fit = TRUE)
+  } else {
+    pterms <- predict(modobj,type = "terms",se.fit = TRUE,newdata=newdata)
+  }
+  
+  
+  if (!is.null(int.term)) {
+    intcol=df %>% select(int.term)
+    int_type <- ifelse(class(intcol[[1]])=="numeric",yes ="numeric",no = "factor")
+  }
+  if (is.null(int.term)) {
+    int.term="no interaction" #this just helps with column selection later
+  }
+  
+  
+  if (add.intercept==TRUE) {
+    pterms.fit <- pterms$fit+mod.intercept
+  } else{
+    pterms.fit <- pterms$fit
+  }
+  pterms.sefit <- pterms$se.fit
+
+  colnames(pterms.fit) <- gsub(x = colnames(pterms.fit),pattern = "s\\(",replacement = "")%>%
+    gsub(pattern = "\\)",replacement = "")
+  colnames(pterms.fit) <- gsub(x = colnames(pterms.fit),pattern = "ti\\(",replacement = "")%>%
+    gsub(pattern = "\\)",replacement = "")
+  colnames(pterms.sefit) <- gsub(x = colnames(pterms.sefit),pattern = "s\\(",replacement = "")%>%
+    gsub(pattern = "\\)",replacement = "")
+
+  pterms.df <- data.frame(pterms.fit)%>%select(any_of(terms),contains(paste0(term,".",int.term)),contains(paste0(int.term,".",term)))%>%
+    mutate(fit=rowSums(across(where(is.numeric))))%>%
+    select(fit)%>%
+    # rename(fit:=!!term)%>%
+    # cbind(data.frame(pterms.sefit)%>%select(matches(term))%>%rename(se.fit:=!!term))%>%
+    cbind(data.frame(pterms.sefit)%>%select(any_of(terms),contains(paste0(term,".",int.term)))%>%mutate(se.fit=rowSums(across(where(is.numeric)))))%>%
+    mutate(upr = fit + 1.96*se.fit,
+           lwr = fit - 1.96*se.fit)%>%
+    # mutate(partial.residuals=fit+resid(modobj))%>%
+    select(fit,se.fit,lwr,upr)
+  
+  
+  if (is.null(newdata)) {
+    plot.df <- cbind(pterms.df,df%>%select(matches(terms))%>%rename_all(.funs = function(x) paste0(x,".raw")))
+  } else {
+    plot.df <- cbind(pterms.df,newdata%>%select(matches(terms))%>%rename_all(.funs = function(x) paste0(x,".raw")))
+  }
+  
+  return(plot.df)
+
+}
+
 # Helper function to map DOY to month names for visualization
 # Args:
 #   doy: Numeric vector of DOY values
