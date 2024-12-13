@@ -43,6 +43,7 @@ weekdaykey<-data.frame(weekday=
                          c("Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday","Monday"),
                        weekdaynum=
                          c(1,2,3,4,5,6,7))
+dark_purples <- RColorBrewer::brewer.pal(n = 8, name = "Purples")[c(4,7)]
 ```
 
 
@@ -216,11 +217,26 @@ doy_to_month <- function(doy) {
 # ABCD Data
 
 ```{r load data, echo = FALSE, }
-# Load ABCD data
-abcd.input <- fread("Data/ABCD/abcdy1.csv")
+abcd.names<-fread('Data/ABCD/ABCD_pull/abcd_tabulated_data-20230412/abcd_tbss01.txt',,na.strings = c("777"))
+abcd<-fread('Data/ABCD/ABCD_pull/abcd_tabulated_data-20230412/abcd_tbss01.txt',,na.strings = c("777"),skip = 2)
+names(abcd)=names(abcd.names)
 
+factorscores <- readRDS('Data/ABCD/DEAP-data-download_ThompsonScores_ResFamIncome.rds')%>%
+  filter(event_name=="baseline_year_1_arm_1")
+
+exosomes <- fread('Data/ABCD/abcd_longitudinal_factor_scores_7f_bifactor.csv')%>%
+  mutate(eventname=Timepoint,src_subject_id=ID)
+
+abcdy1 <- abcd %>% filter(eventname=="baseline_year_1_arm_1")%>%
+  left_join(factorscores)%>%
+  left_join(exosomes)
+#Get Day of Week
+weekdaykey<-data.frame(weekday=
+                         c("Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday","Monday"),
+                       weekdaynum=
+                         c(1,2,3,4,5,6,7))
 # mutate variables 
-abcd.data <- abcd.input%>%
+abcdy1 <- abcdy1%>%
   mutate(int_date=as.Date(interview_date,format = "%m/%d/%Y"))%>%
   mutate(visit_rank = rank(interview_date))%>%
   mutate(weekday = weekdays(int_date))%>%
@@ -228,27 +244,30 @@ abcd.data <- abcd.input%>%
   mutate(doy = yday(int_date))%>%
   mutate(age = as.numeric(interview_age)*30.4375, #age in days
          sex=factor(sex,levels=c("M","F"),labels = c("Male","Female")),
-         osex=ordered(sex),
-         race = factor(race.6level))%>%
+         osex=ordered(sex))%>%
   left_join(weekdaykey)%>%
   mutate(across(contains("uncorrected"), as.numeric))
-setDT(abcd.data)
+setDT(abcdy1)
 
 # Get participants data split
 ## The important column is "matched_group".
 participants <- fread('Data/ABCD/participants_v1.0.3/participants.tsv',sep = "\t")%>%
   mutate(session_id=tolower(session_id))
-abcd.df <- abcd.data %>%
+abcd.df <- abcdy1 %>%
   mutate(participant_id = sub(replacement = "",pattern="_",x = paste0("sub-",src_subject_id),fixed=TRUE),
          session_id = gsub(replacement = "", pattern = "_", x = paste0("ses-",eventname),fixed=TRUE))%>%
   left_join(participants,by=c("participant_id", "session_id"),suffix = c("","y"))
 
-abcd.df <- abcd.df %>% 
+# Get site (this is now included with participants.tsv)
+site <- readRDS("Data/ABCD/DEAP-siteID.rds")%>% filter(event_name=="baseline_year_1_arm_1")
+
+abcd.df <- abcd.df %>% left_join(site)%>%
   mutate(rel_family_id=factor(rel_family_id),
          src_subject_id=factor(src_subject_id),
          eventname = factor(eventname))
 
-remove(abcd.data, participants, abcd.input)
+remove(abcd.cbcl.names,abcd.names,exosomes,factorscores,screen.time,screen.time.names,site,abcdy1,participants,abcd)
+
 ```
 
 ## All ABCD factors
@@ -306,10 +325,11 @@ month.plot
 
 cowplot::save_plot('Figs/SupplementaryFigure1_month.svg',month.plot,base_height = 4,base_width = 3)
 ```
-## Cyclical GAM analyses
+
+### Cyclical GAM analyses
 Fit day-of-year as a cyclical smoothing function.  
 
-```{r}
+```{r, cache=TRUE, echo=FALSE}
 # Reshape and reformat data for modeling
 longdf <- abcd.df %>% 
   pivot_longer(
@@ -555,10 +575,10 @@ model_smooths <-  model_output%>%
   mutate(smooths = map(model,smooth_estimates)) %>%
   unnest(smooths) %>%
   select(-model)%>%
-  filter(smooth=="s(doy)")
+  filter(.smooth=="s(doy)")
 
 abcd_factors=model_smooths%>%
-  mutate(upper=est+1.96*se,lower=est-1.96*se)%>%
+  mutate(upper=.estimate+1.96*.se,lower=.estimate-1.96*.se)%>%
   mutate(date_labels = lubridate::parse_date_time(as.character(floor(doy)),orders="j"))
 
 # Do this another way
@@ -599,7 +619,7 @@ write.table(table.whole.sample.nosibs,file = "ABCD_table_whole_sample_nosibs.csv
 
 ```
 
-### Splits
+### Split-half replication
 
 This code just repeats what we did for the whole sample for each individual split.  
 Fit the models, get fit stats, and make plots.  
@@ -763,14 +783,14 @@ radial.split <- ggplot(rect.tibble,aes(y=Factor,
 cowplot::save_plot('Figs/ABCD.split.lines.svg',lines.split)
 cowplot::save_plot('Figs/ABCD.split.radial.svg',radial.split)
 
-lines.split
-radial.split
+lines.split #display the line plot
+radial.split #display the radial plot
 
 ```
 
 ## Demographics
 ### Sex
-```{r, sex, fig.height=7, fig.width=6}
+```{r, sex, fig.height=7, fig.width=6, cache=TRUE}
 
 # Fit a GAM model to predict neurocognitive PC1 based on various covariates, including sex (osex)
 gmod.sex <- bam(neurocog_pc1.bl~
@@ -829,7 +849,7 @@ cowplot::save_plot('./Figs/Demographics.sex2.svg',combined2,base_height = 5, bas
 
 
 ### Education
-```{r, educ, fig.height=7,fig.width=4}
+```{r, educ, fig.height=7,fig.width=4, cache=TRUE}
 # Relevel education variable for analysis (Some College as the reference group)
 abcd.df$oeduc <- ordered(relevel(abcd.df$high.educ,ref = "Some College"))
 
@@ -882,9 +902,9 @@ cowplot::save_plot('./Figs/Demographics.educ.svg',combined,base_height = 5, base
 ```
 
 ### Income
-```{r, income}
+```{r, income, cache=TRUE}
 # Relevel household income variable for analysis
-abcd.df$household.income <- relevel(abcd.df$household.income,ref = "[missing]")
+abcd.df$household.income <- relevel(abcd.df$household.income,ref = "[>=50K & <100K]")
 
 # Fit a GAM model to predict neurocognitive PC1 based on household income, sex, and other covariates
 gmod.inc <- bam(neurocog_pc1.bl~
@@ -899,7 +919,7 @@ summary(gmod.inc)
 # Prepare data for plotting income effects on neurocognitive scores over the year
 inc.plot.df <- make.plot.df(gmod.inc,term = "doy", int.term = "household.income") %>% 
   mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"))%>%
-  mutate(fac.inc = relevel(factor(household.income),ref="missing"))
+  mutate(fac.inc = relevel(factor(household.income.raw),ref="[<50K]"))
 
 # Plot the fitted values for income groups over the year
 gplot <- ggplot(inc.plot.df,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr,color=fac.inc,fill=fac.inc))+
@@ -933,7 +953,7 @@ cowplot::save_plot('./Figs/Demographics.inc.svg',combined,base_height = 5, base_
 ```
 
 ### Race
-```{r, race}
+```{r, race, cache=TRUE}
 abcd.df$orace.4level <- ordered(abcd.df$race.4level)
 gmod.race <- bam(neurocog_pc1.bl~
                    s(weekdaynum, bs = "cc", k = 7)+
@@ -979,7 +999,7 @@ cowplot::save_plot('./Figs/Demographics.race.svg',combined, base_height = 5, bas
 
 ## Comparing the magnitude of day-of-year and age effects. 
 
-```{r magnitude of effect}
+```{r magnitude of effect,cache=TRUE}
 # Function to get a CI of predicted values
 get_fit_samples <- function(gam.model, newdata) {
   npd <- 1000  # Number of posterior draws
@@ -1079,13 +1099,13 @@ fv_model <- model_output %>%
 
 # Visualize the relationship between age and fitted values by DOY for each factor
 # This plot helps assess how predicted scores vary across age and season.
-ggplot(fv_model, aes(color = doy, y = fitted, x = age)) + 
+ggplot(fv_model, aes(color = doy, y = .fitted, x = age)) + 
   geom_point() + 
   facet_wrap(~Factor)
 
 # Visualize fitted values by DOY across age groups for each factor
 # This allows us to examine seasonal trends and how they interact with age.
-ggplot(fv_model, aes(x = doy, y = fitted, color = age)) + 
+ggplot(fv_model, aes(x = doy, y = .fitted, color = age)) + 
   geom_point() + 
   facet_wrap(~Factor)
 
@@ -1113,8 +1133,8 @@ d_model <- model_output %>%
   mutate(d = map(model, derivatives, data = newdata, term = c('s(doy)', 's(age)'))) %>%
   unnest(d) %>%
   select(-model) %>%
-  group_by(Factor, smooth) %>%
-  summarize(maxslope = max(derivative), minslope = min(derivative))
+  group_by(Factor, .smooth) %>%
+  summarize(maxslope = max(.derivative), minslope = min(.derivative))
 
 # Print a summary statement of the slope comparison for each factor
 # This communicates the relative strength of the age slope vs. summer slope.
@@ -1123,7 +1143,7 @@ d_model %>%
   group_by(Factor) %>%
   mutate(message = sprintf(
     "Kids lose %1.2f days of development in %s for each day of summer",
-    abs(minslope[smooth == "s(doy)"] / maxslope[smooth == "s(age)"]),
+    abs(minslope[.smooth == "s(doy)"] / maxslope[.smooth == "s(age)"]),
     Factor
   )) %>%
   distinct(message) %>%
@@ -1158,7 +1178,7 @@ r2_model <- model_output %>%
 
 ### Repeat while covarying for exposome
 
-```{r}
+```{r, cache=TRUE}
 # Reshape data to prepare for factor-based comparisons in neurocognitive scores
 longdf <- abcd.df %>% 
   pivot_longer(cols = contains("neurocog_pc"), names_to = "Factor", values_to = "score")
@@ -1203,10 +1223,10 @@ fv_model <- model_output %>%
 
 # Plot fitted values against age and doy to observe trends
 # These visualizations display how predicted neurocognitive scores change across age and seasonal effects.
-ggplot(fv_model, aes(color = doy, y = fitted, x = age)) + 
+ggplot(fv_model, aes(color = doy, y = .fitted, x = age)) + 
   geom_point() + 
   facet_wrap(~Factor)
-ggplot(fv_model, aes(x = doy, y = fitted, color = age)) + 
+ggplot(fv_model, aes(x = doy, y = .fitted, color = age)) + 
   geom_point() + 
   facet_wrap(~Factor)
 
@@ -1240,8 +1260,8 @@ d_model <- model_output %>%
   mutate(d = map(model, derivatives, data = newdata, term = c('s(doy)', 's(age)'))) %>%
   unnest(d) %>%
   select(-model) %>%
-  group_by(Factor, smooth) %>%
-  summarize(maxslope = max(derivative), minslope = min(derivative))
+  group_by(Factor, .smooth) %>%
+  summarize(maxslope = max(.derivative), minslope = min(.derivative))
 
 # Print slope comparison message for each factor
 # The message conveys the impact of summer in terms of developmental "days lost."
@@ -1250,7 +1270,9 @@ d_model %>%
   group_by(Factor) %>%
   mutate(message = sprintf(
     "Kids lose %1.2f days of development in %s for each day of summer",
-    abs(minslope[smooth == "s(doy)"] / maxslope[smooth == "s(age)"]),
+    # Calculate the proportion of yearly age effect for summer months
+    # abs(minslope[smooth %in% c("s(doy)")] / maxslope[smooth %in% c("s(age)")]),
+    abs(minslope[.smooth == "s(doy)"] / maxslope[.smooth == "s(age)"]),
     Factor
   )) %>%
   distinct(message) %>%
@@ -1265,7 +1287,7 @@ model_output <- longdf %>%
     model = list(bam(
       score ~ 
         s(age, k = 4) + 
-        ohousehold.income +                      # Adjusted income variable included in model
+        s(General_SES) +                      # Adjusted income variable included in model
         s(weekdaynum, bs = "cc", k = 7) + 
         s(doy, bs = "cc", k = 52) + 
         s(doy, abcd_site, bs = "fs", xt = list(bs = "cc", k = 26)) + 
@@ -1274,8 +1296,8 @@ model_output <- longdf %>%
     )),
     reduced_model = list(bam(
       score ~ 
+        s(General_SES) +
         s(weekdaynum, bs = "cc", k = 7, sp = model[[1]]$sp['s(weekdaynum)']) +
-        s(age, k = 4, sp = model[[1]]$sp['s(age)']) +
         s(doy, bs = "cc", k = 52, sp = model[[1]]$sp['s(doy)']) +
         s(doy, abcd_site, bs = "fs", xt = list(bs = "cc", k = 26)) +
         sex,
@@ -1294,7 +1316,7 @@ r2_model.income <- model_output %>%
 ## Site effects
 Extract model predicted minima for each ABCD site and plot them.  
 
-```{r}
+```{r, cache=TRUE}
 longdf <- abcd.df %>% filter(session_id == "ses-baselineyear1arm1")%>% pivot_longer(cols = contains("neurocog_pc"),names_to = "Factor",values_to = "score")
 
 model_output2 <- longdf %>%
@@ -1312,19 +1334,19 @@ model_smooths2 <-  model_output2%>%
   mutate(smooths = map(model,smooth_estimates)) %>%
   unnest(smooths) %>%
   select(-model)%>%
-  filter(smooth=="s(doy,abcd_site)")
+  filter(.smooth=="s(doy,abcd_site)")
 
 abcd_factors2=model_smooths2%>%
-  mutate(upper=est+1.96*se,lower=est-1.96*se)%>%
+  mutate(upper=.estimate+1.96*.se,lower=.estimate-1.96*.se)%>%
   mutate(date_labels = lubridate::parse_date_time(as.character(floor(doy)),orders="j"))
 
-ggplot(abcd_factors2, aes(x = doy, y = est, ymin = lower, ymax = upper, color = Factor, fill = Factor)) +
+ggplot(abcd_factors2, aes(x = doy, y = .estimate, ymin = lower, ymax = upper, color = Factor, fill = Factor)) +
   geom_ribbon(alpha=.23,color=NA) +
   geom_line() +
   facet_wrap(~abcd_site, scales = "free")
 
 abcd.site.factors.mins2 <- abcd_factors2 %>% group_by(Factor,abcd_site)%>%
-  summarize(min.day = doy[which.min(est)])%>%
+  summarize(min.day = doy[which.min(.estimate)])%>%
   mutate(Factor_names = factor(Factor,
                                levels = c("neurocog_pc1.bl",
                                           "neurocog_pc2.bl",
@@ -1353,10 +1375,10 @@ site.rainclouds <- ggplot(abcd.site.factors.mins2, aes(x=Factor_names, y=min.day
 site.rainclouds
 cowplot::save_plot("Figs/ABCD.sites.raincloud.svg",site.rainclouds)
 
-newdf<-bind_rows(abcd_site_factors,abcd_factors2)
-ggplot(newdf,aes(x=doy,y=est,color = smooth))+geom_line() + facet_wrap(~abcd_site+Factor,scales = "free")+theme(axis.text = element_blank())
-
- remove(abcd_site_factors)
+# newdf<-bind_rows(abcd_site_factors,abcd_factors2)
+# ggplot(newdf,aes(x=doy,y=est,color = smooth))+geom_line() + facet_wrap(~abcd_site+Factor,scales = "free")+theme(axis.text = element_blank())
+# 
+#  remove(abcd_site_factors)
 ```
 
 
@@ -1364,7 +1386,7 @@ ggplot(newdf,aes(x=doy,y=est,color = smooth))+geom_line() + facet_wrap(~abcd_sit
 
 Just repeating for every task. This is a supplementary analysis.  
 
-```{r, eval=TRUE}
+```{r, eval=TRUE, cache=TRUE}
 longdf <- abcd.df %>% pivot_longer(cols = contains("uncorrected"),names_to = "cogtest",values_to = "score") %>%
   mutate(matched_group=factor(matched_group),
          cogtest = str_remove(string=cogtest,pattern = "_uncorrected"),
@@ -1411,7 +1433,7 @@ model_smooths <-  model_output%>%
   mutate(smooths = map(model,smooth_estimates)) %>%
   unnest(smooths) %>%
   select(-model,-reduced_model)%>%
-  filter(smooth=="s(doy)")
+  filter(.smooth=="s(doy)")
 
 r2_model <- model_output%>%
   mutate(partialr2=map2(.x=model,.y=reduced_model,.f= ~partialR2(full_mod=.x,reduced_mod=.y))) %>%
@@ -1419,7 +1441,7 @@ r2_model <- model_output%>%
   select(-model,-reduced_model)
 
 abcd_tasks=model_smooths%>%
-  mutate(upper=est+1.96*se,lower=est-1.96*se)%>%
+  mutate(upper=.estimate+1.96*.se,lower=.estimate-1.96*.se)%>%
   mutate(date_labels = lubridate::parse_date_time(as.character(floor(doy)),orders="j"))
 
 abcd.tasks.mins <- model_output %>% 
@@ -1443,7 +1465,7 @@ Supplementary figure showing the results of the ABCD tasks.
 
 ```{r,eval=TRUE,fig.height=8}
 abcd.tasks.lines <- ggplot(abcd_tasks,
-  aes(x=doy,y=est,color=cogtest,fill=cogtest,ymin=lower,ymax=upper))+
+  aes(x=doy,y=.estimate,color=cogtest,fill=cogtest,ymin=lower,ymax=upper))+
   geom_ribbon(alpha=.1,color=NA)+
   geom_line()+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
@@ -1537,7 +1559,7 @@ pnc <- pnc%>%
   mutate(age = as.numeric(cnbAgeMonths))%>%
   mutate(sex=factor(sex,levels=c(1,2),labels=c("M","F")),osex=ordered(sex))%>%
   mutate(subid=factor(bblid))%>%
-  mutate(race.factor=factor(race, levels = 1:6,labels=levels(abcd.df$race)))%>%
+  mutate(race.factor=factor(race, levels = 1:6,labels=levels(abcd.df$race.6level)))%>%
   left_join(weekdaykey)%>%
   filter(!is.na(NAR_Overall_Accuracy)&!is.na(age))
 setDT(pnc)
@@ -1689,7 +1711,7 @@ pnc.results <- table.pnc %>%
 #### Plot PNC factors
 Generate plots for the above models to visualize the predicted performance across the year.
 
-```{r}
+```{r pncplots}
 
 lines.nine <- ggplot(plot.data.pnc.young,aes(x = doy.raw, y = fit, ymin = lwr, ymax = upr, color = Factor, fill = Factor)) +
   geom_ribbon(alpha=.1,color=NA)+
@@ -1861,7 +1883,7 @@ cowplot::save_plot('Figs/PNC.lines.all.svg',pnc.lines.old.young,base_asp = .88,b
 
 # ADHD 1000
 
-```{r}
+```{r load_adhd1000}
 # Load ADHD 1000 interview doy and dx category
 adhd1000 <- fread("Data/ADHD1000/doy.and.dx.csv")%>%
   left_join(weekdaykey)%>%
@@ -2022,7 +2044,7 @@ sprintf("Number of ADHD-1000 observations: %d",length(adhd.df$src_subject_id))
 ```
 
 ### All tasks: group*doy effect
-```{r}
+```{r adhd_tasks, cache=TRUE}
 # Define cognitive scores and corresponding polished labels
 cog.score.labels <- c("dkefs_colorword3_raw", "dkefs_trail4_raw", "n2backacc", "ssbk_numcomplete", "stop_mrt_int", "dprime1")
 polished.labels = c("Color-Word Interference", "Trails B", "2-Back", "Spatial Span", "Stop-Go RT", "CPT D'")
@@ -2110,30 +2132,30 @@ write.table(adhd1000.results.supplement, "./Tables/ADHD1000.task.results.supplem
 # Define new dataset for plotting clinical effects by ADHD status
 newdata = expand_grid(interview_age = c(median(as.numeric(abcd.df$interview_age))), 
                        doy = 1:365,
-                       ADHD_Status = c("ADHD", "Control"), 
+                       oADHD_Status = c("ADHD", "Control"), 
                        sex = "M",
                        visit_year = levels(adhd.df$visit_year)[1],
                        weekdaynum = 2,
                        src_subject_id = levels(adhd.df$src_subject_id)[1])
 
 # Generate data for plotting by running model predictions
-adhd.plot.data <- model_output %>%
+adhd.plot.data <- model_output.by %>%
   mutate(plot.df = map(.x = model,
-                       .f = ~ make.plot.df(.x, term = "doy", int.term = c("interview_age", "ADHD_Status"), newdata = newdata) %>%
+                       .f = ~ make.plot.df(.x, term = "doy", int.term = c("interview_age", "oADHD_Status"), newdata = newdata) %>%
                          mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw), orders = "j")))) %>%
   unnest(plot.df) %>%
   select(-model)
 
 # Create plot comparing ADHD vs neurotypical performance at age 9.9
-supp.adhd.typical.9y <- ggplot(adhd.plot.data %>% mutate(ADHD_Status = factor(ADHD_Status.raw, levels = c("ADHD", "Control"), labels = c("ADHD", "Neurotypical"))),
-       aes(x = doy.raw, y = fit, ymin = lwr, ymax = upr, color = ADHD_Status.raw, fill = ADHD_Status.raw)) +
+supp.adhd.typical.9y <- ggplot(adhd.plot.data %>% mutate(oADHD_Status = factor(oADHD_Status.raw, levels = c("ADHD", "Control"), labels = c("ADHD", "Neurotypical"))),
+       aes(x = doy.raw, y = fit, ymin = lwr, ymax = upr, color = oADHD_Status, fill = oADHD_Status)) +
   geom_ribbon(alpha = .2, color = NA) +  # Add shaded region for confidence intervals
-  geom_line(size = 1.5) +  # Add line for the fitted values
+  geom_line(size = 1.5) +  # Add line for the fitted values 
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +  # Format x-axis as months
   theme(axis.text.x = element_text(angle = 60, hjust = 1), axis.title.x =  element_blank(), legend.position = "top", legend.title = element_blank()) +
   facet_wrap(~cog.scale, scales = "free_y", nrow = 3) +  # Create facets for each cognitive scale
   ylab("Performance (z-score)") +  # Y-axis label
-  ggtitle("Performance at age 9.9y")
+  ggtitle("Performance at age 9.9y")  # Title for the plot
 
 # Save the plot as an SVG file
 cowplot::save_plot('Figs/ADHD.supp.vs.typical.age9.svg', supp.adhd.typical.9y, base_height = 9, base_width = 9)
@@ -2157,18 +2179,18 @@ ggplot(adhd.plot.data, aes(x = doy.raw, y = fit, ymin = lwr, ymax = upr, color =
 
 newdata =  expand_grid(interview_age=c(median(as.numeric(abcd.df$interview_age))), #,
                        doy=1:365,
-                       ADHD_Status = c("ADHD"), #,"ADHD"
+                       oADHD_Status = c("ADHD"), #,"ADHD"
                        sex="M",
                        visit_year = levels(adhd.df$visit_year)[1],
                        weekdaynum=2,
                        src_subject_id = levels(adhd.df$src_subject_id)[1])
 
-adhd.factors.mins <- model_output %>% 
+adhd.factors.mins <- model_output.by %>% 
   mutate(minmax = map(.x=model,.f=~gam.posterior.smooths.circular(.x,
                                                                   return_draws = FALSE,
                                                                   smooth_var="doy",
                                                                   newdata = newdata,
-                                                                  cov_list=c("interview_age","ADHD_Status")))) %>%
+                                                                  cov_list=c("interview_age","oADHD_Status")))) %>%
   unnest(minmax)%>%
   select(cog.scale,minmax)%>%
   unnest(minmax)%>%
@@ -2230,18 +2252,18 @@ ADHD.radial <- ggplot(rect.tibble,aes(y=cog.scale,
 # Mins for control
 newdata =  expand_grid(interview_age=c(median(as.numeric(abcd.df$interview_age))), #,
                        doy=1:365,
-                       ADHD_Status = c("Control"), #,"ADHD"
+                       oADHD_Status = c("Control"), #,"ADHD"
                        sex="M",
                        visit_year = levels(adhd.df$visit_year)[1],
                        weekdaynum=2,
                        src_subject_id = levels(adhd.df$src_subject_id)[1])
 
-control.factors.mins <- model_output %>% 
+control.factors.mins <- model_output.by %>% 
   mutate(minmax = map(.x=model,.f=~gam.posterior.smooths.circular(.x,
                                                                   return_draws = FALSE,
                                                                   smooth_var="doy",
                                                                   newdata = newdata,
-                                                                  cov_list=c("interview_age","ADHD_Status")))) %>%
+                                                                  cov_list=c("interview_age","oADHD_Status")))) %>%
   unnest(minmax)%>%
   select(cog.scale,minmax)%>%
   unnest(minmax)%>%
@@ -2306,7 +2328,7 @@ Control.radial+ADHD.radial + patchwork::plot_annotation("Day of Minimum Performa
 ```
 
 ### PCA: Overall Performance
-```{r}
+```{r adhd_pca, cache=TRUE}
 zdf <- adhd.df%>% 
   mutate(across(cog.score.labels,scale),
          across(c("dkefs_colorword3_raw","dkefs_trail4_raw", "stop_mrt_int"),~.x*-1))
@@ -2642,10 +2664,25 @@ cowplot::save_plot('Figs/ADHD1000.radial.age.Overall.svg',Age.radial,base_asp = 
 
 # GUSTO
 
-```{r}
+```{r gusto_load}
 # Load GUSTO data
-gusto.data <- fread("Data/GUSTO/gusto.data.csv")
+# gusto.data <- fread("Data/GUSTO/gusto.data.csv")
+gusto.wasi <- fread('Data/GUSTO/GUSTO_WASI.csv')%>%
+  separate(col = "ID",into = c("site","subject-id",sep = "-"))%>%
+  select(!contains("Item"))%>%
+  filter(`WASI usability`=="usable")
+gusto.demographics <-fread('Data/GUSTO/GUSTO_demographics75.csv')%>%
+  mutate(across(.cols="subject-id",.fns=~str_remove(.x,pattern="GUSTO")))%>%
+  mutate(birthdate = as.Date(as.character(`date of birth`),format="%Y%m%d"))
+
+
+gusto.data <- left_join(gusto.wasi,gusto.demographics,by=c("subject-id"))
+# mutate variables 
 gusto.data <- gusto.data%>%
+  mutate(int_date=as.Date(`Date of administration`,format = "%Y-%m-%d"))%>%
+  mutate(weekday = weekdays(int_date))%>%
+  mutate(doy = yday(int_date))%>%
+  mutate(monthnum=month(int_date))%>%
   mutate(sex=factor(sex,levels=c("M","F"),labels=c("M","F")),osex=ordered(sex))%>%
   mutate(subid=factor(`subject-id`))%>%
   left_join(weekdaykey)
@@ -2655,6 +2692,7 @@ setDT(gusto.data)%>%
   filter(!is.na(Matrix.Reasoning.t.score))
 gusto.data %>% 
   gtsummary::tbl_summary(include = c(age,sex))
+
 ```
 
 ## GUSTO Cognitive scores
@@ -2664,7 +2702,7 @@ I am conceptualizing this simply as evidence that Semptember is not universally 
 
 ### All WASI scores
 
-```{r}
+```{r gusto_wasi}
 longdf <- gusto.data %>% pivot_longer(cols = contains("t.score")&!contains("Sum"),names_to = "cogtest",values_to = "score")
 
 model_output <- longdf %>%
@@ -2995,6 +3033,9 @@ rect.tibble <- factor.mins %>%
   bind_rows(factor.mins)%>%
   filter(upper>lower)%>%
   mutate_if(is.Date, as.POSIXct)%>%
+  mutate(study = str_replace(study, pattern = "ABCD Total", replacement = "ABCD"),
+         study = factor(study))%>%
+  filter(!str_detect(study, "ABCD Split"))%>%
   mutate(Factor.sorted = factor(Factor,levels=c("General Cognition","Executive Function","Learning/Memory",
                                     "Overall","Complex Reasoning","Executive","Social","Memory",
                                     "Overal Cognition (9.9y)",

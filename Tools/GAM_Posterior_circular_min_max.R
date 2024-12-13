@@ -36,7 +36,7 @@ circular_median_with_ci <- function(data) {
   return(list(median = median.day, ci.lower = lower.day, ci.upper = upper.day))
 }
 
-gam.posterior.smooths.circular <- function(gam.model,smooth_var,factor_var=NULL, set_fx = FALSE, draws=1000, increments=200, return_draws = TRUE,UNCONDITIONAL = FALSE,make_plots=FALSE,newdata=NULL){
+gam.posterior.smooths.circular <- function(gam.model,smooth_var,factor_var=NULL, set_fx = FALSE, draws=1000, increments=200, return_draws = TRUE,UNCONDITIONAL = FALSE,make_plots=FALSE,newdata=NULL,cov_list = NULL){
   
   # Check the model
   if (any(class(gam.model)=="gam")) {
@@ -67,16 +67,16 @@ gam.posterior.smooths.circular <- function(gam.model,smooth_var,factor_var=NULL,
       newdata <- with(df,expand.grid(x=seq(from=min(df[,smooth_var]),to=max(df[,smooth_var]),length.out=increments),f=unique(df[,factor_var])))
       colnames(newdata)=c(smooth_var,factor_var)
     }
-    
+
     covariates <- all_terms[!(all_terms%in%c(smooth_var,factor_var))]
     if (!is_empty(covariates)) {
-      covariate_values <- df %>% select(all_of(covariates)) %>% summarise_all(.funs = function(x){ifelse(is.numeric(x),yes = mean(x,na.rm=T),no = levels(factor(x))[2])})
+      covariate_values <- df %>% select(all_of(covariates)) %>% summarise_all(.funs = function(x){ifelse(is.numeric(x),yes = mean(x,na.rm=T),no = levels(factor(x))[1])})
       for (cov in covariates) {
         newdata[,cov]=covariate_values[,cov]
       }
     }
   }
- 
+
   
   #Estimate posterior smooth functions (fitted values) from simulated GAM posterior distribution  
   ##Each of the posterior draws has a fitted spline (+ intercept + covariate coefficients) that includes the uncertainty in the estimated model coefficients  
@@ -84,10 +84,25 @@ gam.posterior.smooths.circular <- function(gam.model,smooth_var,factor_var=NULL,
   Vb <- vcov(gam.model, unconditional = UNCONDITIONAL) #variance-covariance matrix for all the fitted model parameters (intercept, covariates, and splines)
   sims <- MASS::mvrnorm(npd, mu = coef(gam.model), Sigma = Vb) #simulate model parameters (coefficents) from the posterior distribution of the smooth based on actual model coefficients and covariance. 
   X0 <- predict(gam.model, newdata = newdata, type = "lpmatrix") #get matrix of linear predictors that maps model parameters to the smooth fit (outcome measure scale)
-  predicted.smooth.values <- X0 %*% t(sims) #generate posterior smooths (fitted y for each set of posterior draw model parameters)
+  # Get the column indices corresponding to the s(doy) term
+  # We actually only want the predicted values for the term of interest, not including contributions of covariates.
+  term_labels <- attr(X0, "dimnames")[[2]]
+  s_doy_cols <- grep("s\\(doy\\)", term_labels)
+  
+  # Zero out all columns except for those corresponding to s(doy) or other listed vars
+  if (is.null(cov_list)) {
+    X0_s_doy <- X0
+    X0_s_doy[, -s_doy_cols] <- 0
+  } else {
+    X0_s_doy <- X0
+    cov_cols <- grep(paste(cov_list, collapse = "|"), term_labels)
+    total_cols <- unique(c(cov_cols, s_doy_cols))
+    X0_s_doy[, -total_cols] <- 0
+  }
+  
+  predicted.smooth.values <- X0_s_doy %*% t(sims) #generate posterior smooths (fitted y for each set of posterior draw model parameters)
   colnames(predicted.smooth.values) <- sprintf("draw%s",seq(from = 1, to = npd)) #label the draws
   predicted.smooth.values <- newdata %>% bind_cols(predicted.smooth.values) #add smooth_var increments from pred df to first column
-  
   #Smooth minimum/maximum values and credible intervals
   #Smooth max + 95% credible interval
 
