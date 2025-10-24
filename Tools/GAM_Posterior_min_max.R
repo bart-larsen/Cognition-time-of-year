@@ -38,7 +38,8 @@ gam.posterior.smooths <- function(gam.model,smooth_var,factor_var=NULL, set_fx =
       }
     }
   }
- 
+  #create a new data frame with a small increment added to the smooth_var column for finite differences
+  newdata2 <- newdata %>% mutate(!!smooth_var := !!sym(smooth_var) + EPS) #add a small increment to the smooth_var column for finite differences
   
   #Estimate posterior smooth functions (fitted values) from simulated GAM posterior distribution  
   ##Each of the posterior draws has a fitted spline (+ intercept + covariate coefficients) that includes the uncertainty in the estimated model coefficients  
@@ -46,6 +47,17 @@ gam.posterior.smooths <- function(gam.model,smooth_var,factor_var=NULL, set_fx =
   Vb <- vcov(gam.model, unconditional = UNCONDITIONAL) #variance-covariance matrix for all the fitted model parameters (intercept, covariates, and splines)
   sims <- MASS::mvrnorm(npd, mu = coef(gam.model), Sigma = Vb) #simulate model parameters (coefficents) from the posterior distribution of the smooth based on actual model coefficients and covariance. 
   X0 <- predict(gam.model, newdata = newdata, type = "lpmatrix") #get matrix of linear predictors that maps model parameters to the smooth fit (outcome measure scale)
+  X1 <- predict(gam.model, newdata = newdata2, type = "lpmatrix") #get matrix of linear predictors that maps model parameters to the smooth fit (outcome measure scale) with incremented smooth_var
+  Xp <- (X1 - X0) / EPS 
+  posterior.derivs <- Xp %*% t(sims) #Xp * simulated model coefficients = simulated derivatives. Each column of posterior.derivs contains derivatives for a different draw from the simulated posterior distribution
+  posterior.derivs <- as.data.frame(posterior.derivs)
+  colnames(posterior.derivs) <- sprintf("draw%s",seq(from = 1, to = npd)) #label the draws
+  posterior.derivs <- cbind(as.numeric(newdata[,smooth_var]), posterior.derivs) #add smooth_var increments from pred df to first column
+  colnames(posterior.derivs)[1] <- sprintf("%s", smooth_var) #label the smooth_var column
+  # colnames(posterior.derivs)[1] <- "label" #label the column
+  posterior.derivs.long <- posterior.derivs %>% pivot_longer(contains("draw"), names_to = "draw",values_to = "posterior.derivative")
+  
+  #Posterior smooths
   predicted.smooth.values <- X0 %*% t(sims) #generate posterior smooths (fitted y for each set of posterior draw model parameters)
   colnames(predicted.smooth.values) <- sprintf("draw%s",seq(from = 1, to = npd)) #label the draws
   predicted.smooth.values <- newdata %>% bind_cols(predicted.smooth.values) #add smooth_var increments from pred df to first column

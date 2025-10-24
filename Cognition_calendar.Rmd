@@ -22,6 +22,8 @@ library(circular)
 library(ggsci)
 library(factoextra)
 library(gt)
+library(ggeffects)
+library(ggsignif)
 
 source("Tools/GAMM_plotting2.R")
 source("Tools/GAM_Effects.R")
@@ -266,7 +268,19 @@ abcd.df <- abcd.df %>% left_join(site)%>%
          src_subject_id=factor(src_subject_id),
          eventname = factor(eventname))
 
-remove(abcd.cbcl.names,abcd.names,exosomes,factorscores,screen.time,screen.time.names,site,abcdy1,participants,abcd)
+# Temperature
+temp.data <- fread("Data/TemperatureAnalysis/3920706.tempexcel.csv")%>%
+  mutate(Zipcode = `Zip Code`)
+temp.site <- fread("data/TemperatureAnalysis/ABCD_Sites.csv")
+temp.df <- temp.data %>% left_join(temp.site)%>%
+  mutate(int_date=as.Date(DATE,format = "%m/%d/%Y"),
+         site = `Site ID`)
+
+abcd.df <- abcd.df %>%
+  left_join(temp.df)%>%
+  mutate(site = as.factor(site))
+
+remove(abcd.names,exosomes,factorscores,site,abcdy1,participants,abcd)
 
 ```
 
@@ -280,7 +294,7 @@ The following blocks of code fit the models and make tables of fit stats and the
 Fit the models for each factor across the whole sample.  
 
 #### Monthly variation
-Figure S1. Cognition varies by month of the year.  
+Figure S1A. Cognition varies by month of the year.  
 
 ```{r,echo=FALSE , fig.height=4, fig.width=3}
 # Convert to long format
@@ -299,32 +313,163 @@ model_output <- longdf %>%
       s(abcd_site, bs = "re"),
     method = "REML")))
 
-# Plot each model 
-plot.data.abcd <-  model_output%>% 
-  mutate(plot.df = map(.x=model,
-                       .f=~ make.plot.df(.x,term = "monthnum")))%>%
-  unnest(plot.df) %>%
+# Plot the effect of month on cognition. Plot One row for each factor.
+plot.data.abcd <- model_output %>%
+  mutate(predictions = map(model, ~ ggemmeans(.x, terms = "monthnum"))) %>%
+  unnest(predictions) %>%
   select(-model)
 
-# Plot the effect of month on cognition. Plot One row for each factor.
 month.plot <- ggplot(plot.data.abcd,
-                      aes(x = monthnum.raw, y = fit, ymin = lwr, ymax = upr)) +
+                     aes(x = x, y = predicted, ymin = conf.low, ymax = conf.high)) +
   geom_point() +
-  geom_linerange() +
-  scale_color_brewer(type = "qual", palette = "Reds", direction = -1) +
-  scale_fill_brewer(type = "qual", palette = "Reds", direction = -1) +
-  scale_x_discrete(breaks = seq(1, 12, by = 1), labels = month.abb)+
+  geom_errorbar(width = 0.2) +
+  scale_x_discrete(labels = month.abb) +
   theme_classic() +
-  facet_wrap(~Factor, ncol = 1) +
+  facet_wrap(~Factor, ncol = 1, scales = "free_y") +
   ylab("Performance") +
-  theme(axis.text.x = element_text(angle = 60, hjust = 1),
-        axis.title.x = element_blank(),
-        legend.title = element_blank(),
-        legend.position = "none") 
+  ggtitle("Cognition by month") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.x = element_blank())
+
 month.plot
 
-cowplot::save_plot('Figs/SupplementaryFigure1_month.svg',month.plot,base_height = 4,base_width = 3)
+cowplot::save_plot('Figs/SupplementaryFigure1_month.svg',month.plot,base_height = 4,base_width = 5)
 ```
+
+#### End of summer (end of summer break) vs spring (before summer break) 
+Figure S1B. Cognition is higher in spring (before summer break) than in late summer (after summer break). Response to reviewer comment.
+```{r}
+# Create the time_group variable separating end of summer visits from spring visits (pre-summer)
+# End of Summer: DOY 238-268. Spring: DOY 32-151.
+longdf <- abcd.df %>%
+  mutate(
+    time_group = case_when(
+      doy >= 238 & doy <= 268 ~ "End of Summer",
+      doy >= 32 & doy <= 151 ~ "Spring",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  pivot_longer(
+    cols = c(neurocog_pc1.bl, neurocog_pc2.bl, neurocog_pc3.bl),
+    names_to = "Factor",
+    values_to = "score"
+  ) %>%
+  mutate(
+    Factor = factor(Factor,
+                    levels = c("neurocog_pc1.bl", "neurocog_pc2.bl", "neurocog_pc3.bl"),
+                    labels = c("General Cognition", "Executive Function", "Learning/Memory"))
+  ) %>%
+  filter(time_group %in% c("Spring", "End of Summer")) %>%
+  # Set Spring as the reference level
+  mutate(
+    time_group = relevel(factor(time_group), ref = "Spring")
+  )
+
+
+# Create equal sized groups
+set.seed(32)
+end_of_summer_count <- longdf %>%
+  filter(time_group %in% c("Spring", "End of Summer")) %>%
+  group_by(Factor,time_group) %>%
+  count() %>%
+  filter(time_group=="End of Summer")# 896 at end of summer
+
+balanced_data <- longdf %>%
+  filter(time_group %in% c("Spring", "End of Summer")) %>%
+  group_by(Factor,time_group) %>%
+  slice_sample(n = end_of_summer_count$n[[1]], replace = FALSE) %>%
+  ungroup()%>%
+  mutate(time_group = relevel(factor(time_group), ref = "Spring"))
+
+# Run the Final Dummy-Coded Analysis on the Balanced Data
+# Fit a separate bam model for each cognitive factor
+model_output <- balanced_data %>%
+  group_by(Factor) %>%
+  summarise(
+    model = list(
+      bam(
+        score ~
+          time_group +
+          s(age) +
+          osex +
+          s(abcd_site, bs = "re") +
+          s(weekdaynum, bs = "cc", k = 7),
+        data = cur_data(),
+        method = "REML"
+      )
+    )
+  )
+
+tidy_output <- model_output %>%
+    mutate(stats = map(model, function(m) {
+      tidy_df <- tidy(m, parametric = TRUE) %>%
+        filter(term == "time_groupEnd of Summer") %>%
+        select(term, estimate, std.error, p.value)
+      
+      eta_df <- eta_squared(m) %>%
+        filter(Parameter == "time_group") %>%
+        select(Eta2_partial)
+      
+      bind_cols(tidy_df, eta_df)
+    })) %>%
+    unnest(stats) %>%
+    select(Factor, term, estimate, std.error, p.value, Eta2_partial)
+
+tidy_output %>% 
+    kableExtra::kbl(escape = F) %>%
+    kableExtra::kable_classic(html_font = "Cambria")
+
+# Plot and show stats marking signficance
+# Create significance labels
+sig_labels <- tidy_output %>%
+  mutate(
+    sig_label = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**",
+      p.value < 0.05 ~ "*",
+      TRUE ~ "ns"
+    )
+  )
+
+# Generate predictions and join with significance data
+plot.data <- model_output %>%
+  mutate(plot.df = map(model, ~ ggeffects::ggemmeans(.x, terms = "time_group"))) %>%
+  unnest(plot.df) %>%
+  select(-model) %>%
+  left_join(sig_labels, by = "Factor")
+
+# Calculate y-position for significance brackets (per Factor)
+signif_data <- plot.data %>% 
+  group_by(Factor) %>% 
+  summarize(
+    y_pos = max(conf.high) + .02,
+    sig_label = first(sig_label)
+  )
+
+# Create plot
+spring_summer_plot <- ggplot(plot.data, aes(x = x, y = predicted)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  geom_signif(
+    data = signif_data,
+    aes(xmin = 1, xmax = 2, annotations = sig_label, y_position = y_pos),
+    manual = TRUE,
+    tip_length = 0.02
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  labs(y = "Performance", title = "Spring and end of summer") +
+  theme_classic() +
+  theme(axis.title.x = element_blank()) +
+  facet_wrap(~Factor, ncol = 1, scale = "free_y")
+
+spring_summer_plot
+  
+# Figure S1
+Figure.S1 <- month.plot + spring_summer_plot + plot_layout(ncol = 2, widths = c(1, .6))
+Figure.S1
+cowplot::save_plot('Figs/SupplementaryFigure1.svg',Figure.S1,base_height = 4,base_width = 6)
+```
+
 
 ### Cyclical GAM analyses
 Fit day-of-year as a cyclical smoothing function.  
@@ -447,6 +592,7 @@ write.table(table.whole.sample, file = "ABCD_table_whole_sample.csv", quote = F,
 #### Plot results
 
 Now plot the ToY effect and plot the day of minimum performance on a polar plot.  
+Figure 1A, top.  
 
 ```{r,echo=FALSE}
 
@@ -458,7 +604,7 @@ line.plot <- ggplot(plot.data.abcd,
   scale_color_brewer(type = "seq", palette = "Reds", direction = -1) +
   scale_fill_brewer(type = "seq", palette = "Reds", direction = -1) +
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
-  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
         axis.title.x = element_blank(),
         legend.title = element_blank(),
         legend.position = "top") +
@@ -621,7 +767,7 @@ write.table(table.whole.sample.nosibs,file = "ABCD_table_whole_sample_nosibs.csv
 
 ### Split-half replication
 
-This code just repeats what we did for the whole sample for each individual split.  
+This code just repeats what we did for the whole sample for two demographically match splits (the ARMS).  
 Fit the models, get fit stats, and make plots.  
 
 ```{r,echo=FALSE,cache=TRUE}
@@ -700,9 +846,10 @@ abcd.results <- table.whole.sample %>%
   rename(Sample:=matched_group) #combine the tables
 ```
 
-#### Plot abcd factor results for each split
+#### Plot abcd factor results for each ARM split
 
-Do the plotting for each split.  
+Do the plotting for each ARM split.  
+Supplementary Figure 2.  
 
 ```{r,echo=FALSE, fig.height=6}
 # Build the line plot depicting the ToY effect.
@@ -712,13 +859,19 @@ lines.split <- ggplot(plot.df.abcd.splits,aes(x=doy.raw,y=fit,color=Factor,fill=
   scale_color_brewer(type = "seq",palette = "Reds",direction = -1)+
   scale_fill_brewer(type = "seq",palette = "Reds",direction = -1)+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
-  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.title = element_blank(),plot.title = element_text(face = "plain"))+
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),
+        axis.title.x =  element_blank(),
+        legend.position.inside = c(.8,1),
+        legend.position = "inside",
+        legend.direction = "horizontal",
+        legend.title = element_blank(),
+        plot.title = element_text(face = "plain"))+
   labs(y = "Performance",
        title = "Split half replication")+
   facet_wrap(~matched_group,labeller = labeller(matched_group = 
     c("1" = "Split 1",
       "2" = "Split 2")))+
-  theme(strip.background = element_blank(),legend.position = "none")
+  theme(strip.background = element_blank())
 
 ## Build rectangles
 # Add two new rows for each row where upper < lower
@@ -730,7 +883,7 @@ rect.tibble <- abcd.factors.mins.splits %>%
     matched_group = .$matched_group,
     Factor = .$Factor,
     max.y = NA,
-    lower = as.Date("2024-01-01"),
+    lower = as.Date("2025-01-01"),
     upper = .$upper,
     min.y = .$min.y
   ), tibble(
@@ -738,7 +891,7 @@ rect.tibble <- abcd.factors.mins.splits %>%
     Factor = .$Factor,
     max.y = NA,
     lower = .$lower,
-    upper = as.Date("2024-12-31"),
+    upper = as.Date("2025-12-31"),
     min.y = .$min.y
   ))) %>%
   ungroup() %>%
@@ -771,7 +924,7 @@ radial.split <- ggplot(rect.tibble,aes(y=Factor,
         axis.ticks = element_blank(),
         panel.grid.major.y = element_blank(),
         panel.spacing = unit(2, "lines"),
-        legend.position = "bottom",
+        legend.position = "none",
         legend.title = element_blank(),
         plot.title = element_text(face = "plain"))+
   coord_polar(start = -pi/365,clip = "off")+
@@ -785,10 +938,153 @@ cowplot::save_plot('Figs/ABCD.split.radial.svg',radial.split)
 
 lines.split #display the line plot
 radial.split #display the radial plot
+Supplementary.Figure.2 <- lines.split + radial.split + plot_layout(nrow=1,heights = c(.8,1),widths = c(.66,1))
+cowplot::save_plot('Figs/SupplementaryFigure2_ABCD.splits.svg',Supplementary.Figure.2,base_height = 4,base_width = 12)
 
 ```
 
+#### Random splits
+Re-fit the models for n=20 random splits of the data. 
+
+```{r,echo=FALSE,cache=TRUE}
+
+# Set number of random splits
+n_splits <- 20
+
+set.seed(23)
+
+# Function to process one random split
+process_split <- function(split_num, data) {
+  # Sample half the data
+  sampled_data <- data %>%
+    slice_sample(prop = 0.5)
+  
+  # Prepare long format
+  longdf <- sampled_data %>%
+    pivot_longer(cols = c("neurocog_pc1.bl", "neurocog_pc2.bl", "neurocog_pc3.bl"), names_to = "Factor", values_to = "score") %>%
+    mutate(Factor = factor(Factor, levels = c("neurocog_pc1.bl", "neurocog_pc2.bl", "neurocog_pc3.bl"), 
+                          labels = c("General Cognition", "Executive Function", "Learning/Memory")))
+  
+  # Fit models
+  model_output <- longdf %>%
+    group_by(Factor) %>%
+    summarise(model = list(bam(
+      score ~ 
+        s(age) +
+        s(weekdaynum, bs = "cc", k = 7) +
+        s(doy, bs = "cc", k = 52) +
+        s(doy, abcd_site, bs = "sz", xt = list(bs = "cc", k = 26)) +
+        sex,
+      method = "REML")),
+      .groups = "drop") %>%
+    mutate(split_id = split_num)
+  
+  return(model_output)
+}
+
+# Filter data once
+filtered_data <- abcd.df 
+
+# Run for all splits
+model_output <- map_dfr(1:n_splits, ~process_split(.x, filtered_data))
+
+# Rest of your analysis code stays the same
+tidy_model <- model_output %>%
+  mutate(tidy = map(model, function(x) {
+    tidydf = broom::tidy(x)
+    tidydf$N = length(x$residuals)
+    tidydf
+  })) %>%
+  unnest(tidy) %>%
+  select(-model) %>%
+  filter(str_detect(string = term, pattern = "s\\(doy\\)")) %>%
+  mutate(pfdr = p.adjust(p.value)) %>%
+  relocate(N, .before = "edf")
+
+tidy_model %>% 
+  kableExtra::kbl(escape = F, caption = "Model output for random splits and factors") %>% 
+  kableExtra::kable_classic(html_font = "Cambria")
+
+plot.df.abcd.splits <- model_output %>%
+  mutate(plot.df = map(model,
+                       .f = ~ make.plot.df(.x, term = "doy", add.intercept = FALSE))) %>%
+  unnest(plot.df) %>%
+  select(-model)
+
+# get the minima
+abcd.factors.mins.splits.random <- model_output %>% 
+  mutate(minmax = map(.x = model, .f = ~ gam.posterior.smooths.circular(.x, return_draws = FALSE, smooth_var = "doy"))) %>% 
+  unnest(minmax) %>%
+  select(split_id, Factor, minmax) %>%
+  unnest(minmax) %>%
+  filter(is.na(max.y)) %>%
+  mutate(across(.cols = where(is.numeric), .fns = ~ lubridate::parse_date_time(as.character(floor(.)), orders = "j")))
+
+```
+
+#### Plot the random splits
+Figure 1A bottom.  
+
+```{r}
+# Build the line plot depicting the ToY effect across random splits
+lines.split <- ggplot(plot.df.abcd.splits, aes(x = doy.raw, y = fit,group = split_id, ymin = lwr, ymax = upr,color = Factor, fill=Factor)) +
+  # geom_ribbon(alpha = .1, color = NA) +
+  geom_line() +
+  scale_color_brewer(type = "seq", palette = "Reds", direction = -1) +
+  scale_fill_brewer(type = "seq", palette = "Reds", direction = -1) +
+  scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.x = element_blank(),
+        legend.title = element_blank(),
+        plot.title = element_text(face = "plain")) +
+  labs(y = "Performance",
+       title = "Random splits") +
+  facet_wrap(~Factor, ) +
+  theme(strip.background = element_blank(), legend.position = "none")
+
+## Build points dataframe - just the minima points, no rectangles needed
+points.tibble <- abcd.factors.mins.splits.random %>%
+  mutate_if(is.POSIXct, as.Date) %>%  # Convert all date-time columns to date for easier comparison
+  mutate_if(is.Date, as.POSIXct)
+
+# Plot all points together
+radial.split <- ggplot(points.tibble, aes(y = as.numeric(Factor),
+                                           x = min.y,
+                                           fill = Factor,
+                                           color = Factor)) +
+  geom_point(alpha = 0.5, size = 2) +  # Add some transparency since there will be many points
+  scale_color_brewer(type = "seq", palette = "Reds", direction = -1) +
+  scale_fill_brewer(type = "seq", palette = "Reds", direction = -1) +
+  scale_x_datetime(date_labels = "%B",
+                   limits = lubridate::parse_date_time(c("1", "365"), orders = "j"),
+                   date_breaks = "1 months") +
+  cowplot::theme_minimal_grid() +
+  ylim(0,3)+
+  theme(axis.text.x = element_text(hjust = 1, vjust = -1),
+        axis.title = element_blank(),
+        axis.line.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.spacing = unit(2, "lines"),
+        legend.position = "bottom",
+        legend.title = element_blank(),
+        plot.title = element_text(face = "plain")) +
+  coord_polar(start = -pi/365, clip = "off") +
+  ggtitle("Day of Minimum Performance Across Random Splits")
+
+cowplot::save_plot('Figs/ABCD.random.lines.svg',lines.split)
+cowplot::save_plot('Figs/ABCD.random.radial.svg',radial.split)
+Figure.1A.Bottom <- lines.split + radial.split 
+Figure.1A.Bottom
+cowplot::save_plot('Figs/Figure1A.bottom.svg',Figure.1A.Bottom,base_height = 5,base_width = 10)
+
+```
+
+
 ## Demographics
+Examine how the effect of calendar day varies by demographic variables.  
+
 ### Sex
 ```{r, sex, fig.height=7, fig.width=6, cache=TRUE}
 
@@ -808,11 +1104,11 @@ sex.plot.df <- make.plot.df(modobj = gmod.sex, term = "doy", int.term = "osex")%
   mutate(date_labels = lubridate::parse_date_time(as.character(doy.raw),orders="j"))
   
 # Define custom breaks for x-axis labels (dates)
-custom_breaks <- c(ymd_hms("2024-01-01 00:00:00"), 
-                   seq(from = ymd_hms("2024-04-01 00:00:00"), 
-                       to = ymd_hms("2024-12-01 00:00:00"), 
+custom_breaks <- c(ymd_hms("2025-01-01 00:00:00"), 
+                   seq(from = ymd_hms("2025-04-01 00:00:00"), 
+                       to = ymd_hms("2025-12-01 00:00:00"), 
                        by = "3 months"),
-                   ymd_hms("2024-12-31 00:00:00"))
+                   ymd_hms("2025-12-31 00:00:00"))
 
 # Plot the fitted values with confidence ribbons and line
 gplot <- ggplot(sex.plot.df,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr,color=osex.raw,fill=osex.raw))+
@@ -836,7 +1132,7 @@ rplot2<-ggplot(gmod.sex$model,
   scale_color_brewer(type = "qual",aesthetics = c("fill","color"))+
   coord_flip()+
   geom_boxplot(width=.15,fill=NA)+
-  theme(legend.position="none",legend.title = element_blank(),axis.title=element_blank(),axis.text.x = element_text(angle=60,hjust=1,vjust=1),axis.text.y=element_blank(),axis.ticks.y = element_blank())
+  theme(legend.position="none",legend.title = element_blank(),axis.title=element_blank(),axis.text.x = element_text(angle = 45,hjust=1,vjust=1),axis.text.y=element_blank(),axis.ticks.y = element_blank())
 
 # Combine and display the plots
 combined2 <- gplot/rplot2 + plot_layout(heights = c(2, 1.5))
@@ -892,7 +1188,7 @@ rplot<-ggplot(gmod.educ$model%>%
   scale_color_brewer(type = "qual",aesthetics = c("fill","color"))+
   coord_flip()+
   geom_boxplot(width=.15,fill=NA)+
-  theme(legend.position="none",legend.title = element_blank(),axis.title=element_blank(),axis.text.x = element_text(angle=60,hjust=1,vjust=1),axis.text.y=element_blank(),axis.ticks.y = element_blank())
+  theme(legend.position="none",legend.title = element_blank(),axis.title=element_blank(),axis.text.x = element_text(angle = 45,hjust=1,vjust=1),axis.text.y=element_blank(),axis.ticks.y = element_blank())
 
 # Combine and display the plots
 combined <- gplot/rplot + plot_layout(heights = c(2, 1.5))
@@ -902,6 +1198,7 @@ cowplot::save_plot('./Figs/Demographics.educ.svg',combined,base_height = 5, base
 ```
 
 ### Income
+
 ```{r, income, cache=TRUE}
 # Relevel household income variable for analysis
 abcd.df$household.income <- relevel(abcd.df$household.income,ref = "[>=50K & <100K]")
@@ -943,7 +1240,7 @@ rplot<-ggplot(gmod.inc$model%>%
   scale_color_brewer(type = "qual",aesthetics = c("fill","color"))+
   coord_flip()+
   geom_boxplot(width=.15,fill=NA)+
-  theme(legend.position="none",legend.title = element_blank(),axis.title = element_blank(),axis.text.x = element_text(angle=60,hjust=1,vjust=1),axis.text.y=element_blank(),axis.ticks.y = element_blank())
+  theme(legend.position="none",legend.title = element_blank(),axis.title = element_blank(),axis.text.x = element_text(angle = 45,hjust=1,vjust=1),axis.text.y=element_blank(),axis.ticks.y = element_blank())
 
 # Combine and display the plots
 combined <- gplot/rplot + plot_layout(heights = c(2, 1.5))
@@ -991,7 +1288,7 @@ rplot<-ggplot(gmod.race$model%>%mutate(fac.race = factor(orace.4level,levels=lev
   scale_color_brewer(type = "qual",aesthetics = c("fill","color"))+
   coord_flip()+
   geom_boxplot(width=.15,fill=NA)+
-  theme(legend.position="none",legend.title = element_blank(),axis.title=element_blank(),axis.text.x = element_text(angle=60,hjust=1,vjust=1),axis.text.y=element_blank(),axis.ticks.y = element_blank())
+  theme(legend.position="none",legend.title = element_blank(),axis.title=element_blank(),axis.text.x = element_text(angle = 45,hjust=1,vjust=1),axis.text.y=element_blank(),axis.ticks.y = element_blank())
 combined <- gplot/rplot + plot_layout(heights = c(2, 1.5))
 combined
 cowplot::save_plot('./Figs/Demographics.race.svg',combined, base_height = 5, base_width = 3.3)
@@ -1151,7 +1448,6 @@ d_model %>%
   walk(~ cat(.x, '\n'))
 
 # Compute partial R2 for age to measure its effect size in the model
-# Here, we calculate the partial R2 for the age effect, which isolates its contribution.
 model_output <- longdf %>%
   group_by(Factor) %>%
   summarise(
@@ -1169,7 +1465,6 @@ model_output <- longdf %>%
   )
 
 # Calculate partial R2 for age by comparing full and reduced models
-# Partial R2 captures the variance in the response explained by age after accounting for other variables.
 r2_model <- model_output %>%
   mutate(partialr2 = map2(model, reduced_model, partialR2)) %>%
   unnest(partialr2) %>%
@@ -1381,16 +1676,32 @@ cowplot::save_plot("Figs/ABCD.sites.raincloud.svg",site.rainclouds)
 #  remove(abcd_site_factors)
 ```
 
-
 ## All abcd tasks
 
-Just repeating for every task. This is a supplementary analysis.  
+Just repeating for every task. Now included in figure 1B.  
 
 ```{r, eval=TRUE, cache=TRUE}
-longdf <- abcd.df %>% pivot_longer(cols = contains("uncorrected"),names_to = "cogtest",values_to = "score") %>%
-  mutate(matched_group=factor(matched_group),
-         cogtest = str_remove(string=cogtest,pattern = "_uncorrected"),
-         cogtest = str_replace(string=cogtest,pattern = "_",replacement = " "))
+longdf <- abcd.df %>% 
+  pivot_longer(cols = contains("uncorrected"), names_to = "cogtest", values_to = "score") %>%
+  mutate(
+    matched_group = factor(matched_group),
+    cogtest = str_remove(string = cogtest, pattern = "_uncorrected"),
+    cogtest = str_replace(string = cogtest, pattern = "nihtbx_", replacement = ""),
+    cogtest = factor(cogtest, 
+                    levels = c("cardsort", "cryst", "flanker", "fluidcomp", 
+                              "list", "pattern", "picture", "picvocab", 
+                              "reading", "totalcomp"),
+                    labels = c("Card Sort", 
+                              "Crystallized Composite", 
+                              "Flanker", 
+                              "Fluid Composite", 
+                              "List Sorting", 
+                              "Pattern Comparison", 
+                              "Picture Sequence", 
+                              "Picture Vocabulary", 
+                              "Reading", 
+                              "Total Composite"))
+  )
 
 
 
@@ -1470,9 +1781,14 @@ abcd.tasks.lines <- ggplot(abcd_tasks,
   geom_line()+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
   # scale_color_viridis_d(aesthetics = c("fill","color"),option = "inferno")+
-  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.title = element_blank(),
-        plot.title = element_text(face = "plain"),strip.background = element_blank())+
-  ggtitle("ABCD NIH Toolbox")+ylab("Performance (zero-centered)")
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),
+        axis.title.x = element_blank(),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 10),  
+        plot.title = element_text(face = "plain"),
+        strip.background = element_blank())+
+  ggtitle("ABCD NIH Toolbox")+
+  ylab("Day-of-year effect")
   # facet_wrap(~matched_group,labeller = labeller(matched_group = 
     # c("1" = "Split 1",
     #   "2" = "Split 2")))
@@ -1487,7 +1803,7 @@ rect.tibble <- abcd.tasks.mins %>%
     cogtest = .$cogtest,
     matched_group = .$matched_group,
     max.y = NA,
-    lower = as.Date("2024-01-01"),
+    lower = as.Date("2025-01-01"),
     upper = .$upper,
     min.y = .$min.y
   ), tibble(
@@ -1495,7 +1811,7 @@ rect.tibble <- abcd.tasks.mins %>%
     matched_group = .$matched_group,
     max.y = NA,
     lower = .$lower,
-    upper = as.Date("2024-12-31"),
+    upper = as.Date("2025-12-31"),
     min.y = .$min.y
   ))) %>%
   ungroup() %>%
@@ -1718,7 +2034,7 @@ lines.nine <- ggplot(plot.data.pnc.young,aes(x = doy.raw, y = fit, ymin = lwr, y
   geom_line(show.legend = T)+
   scale_color_brewer(type = "seq",palette = "PuBu",direction = -1,aesthetics = c("fill","color"))+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
-  theme(axis.text.x = element_text(angle=45,hjust=1),axis.title.x = element_blank(),legend.title = element_blank(), legend.position = "top")+
+  theme(axis.text.x = element_text(ange=60,hjust=1),axis.title.x = element_blank(),legend.title = element_blank(), legend.position = "top")+
   ylab("Performance")+
   ggtitle("PNC at median age of ABCD (9.9y)")
 
@@ -1727,7 +2043,7 @@ lines.twenty <- ggplot(plot.data.pnc.old,aes(x = doy.raw, y = fit, ymin = lwr, y
   geom_line(show.legend = T, linetype = 2)+
   scale_color_brewer(type = "seq",palette = "PuBu",direction = -1,aesthetics = c("fill","color"))+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
-  theme(axis.text.x = element_text(angle=45,hjust=1),axis.title.x = element_blank(),legend.title = element_blank(), legend.position = "top")+
+  theme(axis.text.x = element_text(ange=60,hjust=1),axis.title.x = element_blank(),legend.title = element_blank(), legend.position = "top")+
   ylab("Performance (zero centered)")+
   ggtitle("PNC at median age of ABCD (9.9y)")
 
@@ -1755,7 +2071,7 @@ pnc.lines.old.young <- ggplot(plot.data.pnc.all %>% na.omit(),
   geom_line(show.legend = T)+
   scale_color_brewer(type = "seq",palette = "PuBu",aesthetics = c("fill","color"),direction = -1)+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
-  theme(axis.text.x = element_text(angle=45,hjust=1),axis.title.x = element_blank())+
+  theme(axis.text.x = element_text(ange=60,hjust=1),axis.title.x = element_blank())+
   ylab("Performance")+
   ggtitle("PNC: Penn Computerized Neurocognitive Battery")+
   theme(legend.title = element_blank(),legend.position = "top")
@@ -1774,7 +2090,7 @@ rect.tibble <- pnc.mins.all %>%
     Factor = .$Factor,
     study.label = .$study.label,
     max.y = NA,
-    lower = as.Date("2024-01-01"),
+    lower = as.Date("2025-01-01"),
     upper = .$upper,
     min.y = .$min.y
   ), tibble(
@@ -1782,7 +2098,7 @@ rect.tibble <- pnc.mins.all %>%
     study.label = .$study.label,
     max.y = NA,
     lower = .$lower,
-    upper = as.Date("2024-12-31"),
+    upper = as.Date("2025-12-31"),
     min.y = .$min.y
   ))) %>%
   ungroup() %>%
@@ -2152,7 +2468,7 @@ supp.adhd.typical.9y <- ggplot(adhd.plot.data %>% mutate(oADHD_Status = factor(o
   geom_ribbon(alpha = .2, color = NA) +  # Add shaded region for confidence intervals
   geom_line(size = 1.5) +  # Add line for the fitted values 
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +  # Format x-axis as months
-  theme(axis.text.x = element_text(angle = 60, hjust = 1), axis.title.x =  element_blank(), legend.position = "top", legend.title = element_blank()) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x =  element_blank(), legend.position = "top", legend.title = element_blank()) +
   facet_wrap(~cog.scale, scales = "free_y", nrow = 3) +  # Create facets for each cognitive scale
   ylab("Performance (z-score)") +  # Y-axis label
   ggtitle("Performance at age 9.9y")  # Title for the plot
@@ -2165,7 +2481,7 @@ ggplot(adhd.plot.data, aes(x = doy.raw, y = fit, ymin = lwr, ymax = upr, color =
   geom_ribbon(alpha = .25, color = NA) +  # Add shaded region for confidence intervals
   geom_line(size = 1.5) +  # Add line for the fitted values
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +  # Format x-axis as months
-  theme(axis.text.x = element_text(angle = 60, hjust = 1), axis.title.x =  element_blank(), legend.position = "top", legend.title = element_blank()) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.title.x =  element_blank(), legend.position = "top", legend.title = element_blank()) +
   facet_wrap(~cog.scale, scales = "free_y", nrow = 3) +  # Create facets for each cognitive scale
   ylab("Performance (z-score)") +  # Y-axis label
   ggtitle("ADHD status effect across 'doy'")
@@ -2206,14 +2522,14 @@ rect.tibble <- adhd.factors.mins %>%
   do(bind_rows(., tibble(
     cog.scale = .$cog.scale,
     max.y = NA,
-    lower = as.Date("2024-01-01"),
+    lower = as.Date("2025-01-01"),
     upper = .$upper,
     min.y = .$min.y
   ), tibble(
     cog.scale = .$cog.scale,
     max.y = NA,
     lower = .$lower,
-    upper = as.Date("2024-12-31"),
+    upper = as.Date("2025-12-31"),
     min.y = .$min.y
   ))) %>%
   ungroup() %>%
@@ -2279,14 +2595,14 @@ rect.tibble <- control.factors.mins %>%
   do(bind_rows(., tibble(
     cog.scale = .$cog.scale,
     max.y = NA,
-    lower = as.Date("2024-01-01"),
+    lower = as.Date("2025-01-01"),
     upper = .$upper,
     min.y = .$min.y
   ), tibble(
     cog.scale = .$cog.scale,
     max.y = NA,
     lower = .$lower,
-    upper = as.Date("2024-12-31"),
+    upper = as.Date("2025-12-31"),
     min.y = .$min.y
   ))) %>%
   ungroup() %>%
@@ -2417,7 +2733,7 @@ pcplot.adhd <- ggplot(plot.data.adhd%>%filter(interview_age.raw==119),aes(x=doy.
                      values = dark_purples,
                      labels = c("ADHD", "Neurotypical"),    # Relabel the factor levels
                      name = NULL)+
-  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
   ylab("PC1")
 pcplot.adhd
 
@@ -2439,7 +2755,7 @@ pcplot.combo <- ggplot(plot.data.adhd,aes(x=doy.raw,
   # scale_linetype_manual(values=c(1,6),labels = c("9.9y", "19y"),    # Relabel the factor levels
   #                    name = NULL)+
   ylab("Overall Performance")+ ggtitle("ADHD-1000")+facet_wrap(~interview_age.raw,scales = "free_y")+
-  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top",plot.title = element_text(face = "plain"))+theme(strip.background = element_blank(),legend.position = "top")
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top",plot.title = element_text(face = "plain"))+theme(strip.background = element_blank(),legend.position = "top")
 
 cowplot::save_plot('Figs/ADHD.lines.all.Overall.svg',pcplot.combo)
 pcplot.combo
@@ -2458,7 +2774,7 @@ pcplot.age <- ggplot(adhd.plot.df.age,aes(x=doy.raw,y=fit,linetype=factor(interv
   #                    values = dark_purples,
   #                    labels = c("9.9", "19"),    # Relabel the factor levels
   #                    name = "Age (years)") +
-  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
     ylab("Overall Performance")+ ggtitle("ADHD-1000")
 
 cowplot::save_plot('Figs/ADHD.lines.Age.Overall.svg',pcplot.age,base_asp = 1.25)
@@ -2473,7 +2789,7 @@ pcplot.age.nine <- ggplot(adhd.plot.df.age%>%filter(interview_age.raw==119),aes(
   scale_linetype_manual(values=c(1,6),labels = c("9.9y", "20y"),    # Relabel the factor levels
                      name = NULL)+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
-  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
     ylab("Performance")+ ggtitle("ADHD-1000")
 
 cowplot::save_plot('Figs/ADHD.lines.Age.9.svg',pcplot.age.nine,base_asp = .88)
@@ -2485,7 +2801,7 @@ pcplot.age.twenty <- ggplot(adhd.plot.df.age%>%filter(interview_age.raw==240),ae
   geom_line(size=1.5,color = dark_purples[2],linetype = 2)+ 
   # scale_x_datetime(date_labels = "%B",limits = lubridate::parse_date_time(c("1","365"),orders="j"),date_breaks = "1 month")+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
-  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title = element_blank())+
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title = element_blank())+
     ylab("Performance")+ ggtitle("ADHD-1000")
 cowplot::save_plot('Figs/ADHD.lines.Age.20.svg',pcplot.age.twenty,base_asp = .88)
 pcplot.age.twenty
@@ -2528,14 +2844,14 @@ rect.tibble <- control.factors.mins %>%
   do(bind_rows(., tibble(
     cog.scale = .$cog.scale,
     max.y = NA,
-    lower = as.Date("2024-01-01"),
+    lower = as.Date("2025-01-01"),
     upper = .$upper,
     min.y = .$min.y
   ), tibble(
     cog.scale = .$cog.scale,
     max.y = NA,
     lower = .$lower,
-    upper = as.Date("2024-12-31"),
+    upper = as.Date("2025-12-31"),
     min.y = .$min.y
   ))) %>%
   ungroup() %>%
@@ -2612,14 +2928,14 @@ rect.tibble <- age.factors.mins.adhd1000 %>%
   do(bind_rows(., tibble(
     cog.scale = .$cog.scale,
     max.y = NA,
-    lower = as.Date("2024-01-01"),
+    lower = as.Date("2025-01-01"),
     upper = .$upper,
     min.y = .$min.y
   ), tibble(
     cog.scale = .$cog.scale,
     max.y = NA,
     lower = .$lower,
-    upper = as.Date("2024-12-31"),
+    upper = as.Date("2025-12-31"),
     min.y = .$min.y
   ))) %>%
   ungroup() %>%
@@ -2688,8 +3004,9 @@ gusto.data <- gusto.data%>%
   left_join(weekdaykey)
 
 names(gusto.data)<-make.names(names(gusto.data))
-setDT(gusto.data)%>%
+gusto.data <- gusto.data %>%
   filter(!is.na(Matrix.Reasoning.t.score))
+setDT(gusto.data)
 gusto.data %>% 
   gtsummary::tbl_summary(include = c(age,sex))
 
@@ -2784,7 +3101,7 @@ gusto.lines <- ggplot(plot.data.gusto,aes(x=doy.raw,y=fit,color=cogtest,fill=cog
   scale_color_manual(values = brewer_pal(4, "Greens")(5)[c(3,5)],aesthetics = c("fill","color"))+
   # scale_color_brewer(palette = "Greens",aesthetics = c("color","fill"))+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
-  theme(axis.text.x=element_text(angle=60,hjust = 1),
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),
         axis.title.x =  element_blank(),
         legend.title = element_blank(),
         legend.position = "top")+
@@ -2802,14 +3119,14 @@ rect.tibble <- gusto.wasi.mins %>%
   do(bind_rows(., tibble(
     cogtest = .$cogtest,
     max.y = NA,
-    lower = as.Date("2024-01-01"),
+    lower = as.Date("2025-01-01"),
     upper = .$upper,
     min.y = .$min.y
   ), tibble(
     cogtest = .$cogtest,
     max.y = NA,
     lower = .$lower,
-    upper = as.Date("2024-12-31"),
+    upper = as.Date("2025-12-31"),
     min.y = .$min.y
   ))) %>%
   ungroup() %>%
@@ -2851,7 +3168,7 @@ cowplot::save_plot('Figs/GUSTO.radial.svg',gusto.radial)
 
 ## Demographic table
 
-```{r}
+```{r, demographic_table}
 theme_gtsummary_journal(journal = "jama")
 demo.table <- bind_rows(
   abcd.df%>% filter(!is.na(neurocog_pc1.bl))%>%select(age,sex,doy)%>%mutate(study="ABCD",age=age/30.4/12),
@@ -2880,7 +3197,7 @@ write.table(all.results,file = "./Tables/AllDOYresults.csv",sep = ",",row.names 
 Supplemental figure.  
 This figure shows the density of visit days across the year for each dataset. This is a way to visualize the distribution of visits across the year.  
 
-```{r}
+```{r, doy_densities_figu}
 visit.times.by.dataset <- bind_rows(
   abcd.df%>%select(age,sex,doy)%>%mutate(study="ABCD",age=age/12),
   pnc%>%select(age,sex,doy)%>%mutate(study="PNC",age=age/12),
@@ -2911,7 +3228,7 @@ Figure 4.
 This figure shows the day of minimum performance for all datasets. 
 
 
-```{r}
+```{r, circle_plots_all}
 gusto.factors <- plot.data.gusto%>%
   rename("Factor"=cogtest)%>%
   mutate(study="GUSTO")
@@ -2923,7 +3240,8 @@ pnc_factors <- plot.data.pnc.all%>%
   select(colnames(gusto.factors))
 adhd.factors <- adhd.plot.df.age%>%
   filter(interview_age.raw  == 119)%>%
-  mutate(Factor = "Overall",study = "ADHD-1000")
+  mutate(Factor = "Overall",study = "ADHD-1000")%>%
+  select(colnames(gusto.factors))
 
 
 all_factors <- bind_rows(abcd_factors, pnc_factors, gusto.factors, adhd.factors) %>%
@@ -2951,7 +3269,7 @@ all.factor.plot <- ggplot(all_factors%>%filter(!study == "PNC_20y"), aes(x = doy
                                 brewer_pal(palette = "Greens")(4)[4]),
                      aesthetics = c("fill","color"))+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
-  theme(axis.text.x = element_text(angle = 60, hjust = 1),
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
         axis.title.x = element_blank(),
         legend.title = element_blank(),
         legend.position = "top") +
@@ -3005,7 +3323,7 @@ write.table(factor.mins.table,file = "./Tables/AllFactorMins.csv",sep = ",",row.
 #   geom_line()+
 #   ggtitle("")+
 #   scale_x_datetime(date_labels = "%B",limits = lubridate::parse_date_time(c("1","365"),orders="j"))+
-#   theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank())
+#   theme(axis.text.x=element_text(angle = 45,hjust = 1),axis.title.x =  element_blank())
 
 
 ## Build rectangles
@@ -3017,7 +3335,7 @@ rect.tibble <- factor.mins %>%
   do(bind_rows(., tibble(
     Factor = .$Factor,
     max.y = NA,
-    lower = as.Date("2024-01-01"),
+    lower = as.Date("2025-01-01"),
     upper = .$upper,
     min.y = .$min.y,
     study = .$study,
@@ -3025,7 +3343,7 @@ rect.tibble <- factor.mins %>%
     Factor = .$Factor,
     max.y = NA,
     lower = .$lower,
-    upper = as.Date("2024-12-31"),
+    upper = as.Date("2025-12-31"),
     min.y = .$min.y,
     study = .$study
   ))) %>%
@@ -3163,7 +3481,7 @@ abcd.exposome<-ggplot(plot.data,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr,linetype =
   scale_linetype_manual(values = c(2,1)) +
   guides(linetype = guide_legend(title = "Exposome"))+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
-  theme(axis.text.x=element_text(angle=60,hjust = 1),
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),
         axis.title.x =  element_blank(),
         legend.position = "top")+
   ylab("General Cognition")+
@@ -3177,7 +3495,7 @@ abcd.exposome.2<-ggplot(plot.data2,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr))+
   geom_line(color = "#386cb0")+
   # scale_color_brewer(type = "div",aesthetics = c("color","fill"))+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
-  theme(axis.text.x=element_text(angle=60,hjust = 1),
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),
         axis.title.x =  element_blank(),
         legend.position = "top")+
   ylab("General Cognition")+
@@ -3222,7 +3540,7 @@ exposome.doy <- ggplot(plot.data,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr))+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
   scale_color_viridis_d(option = "inferno",aesthetics = c("fill","color"),begin = .6,end = .8)+
   # scale_fill_viridis_d()+
-  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
   ylab("Exposome")+ggtitle("ABCD")
 exposome.doy
 
@@ -3263,10 +3581,97 @@ reduced.model.SESeffect <- bam(neurocog_pc1.bl~
 partialR2(gmod.exposome.covses,reduced.model)
 partialR2(gmod.exposome.covses,reduced.model.SESeffect)
 
+# Covary for every single exposome factor
+gmod.exposome.covses <- bam(neurocog_pc1.bl~
+                       s(weekdaynum, bs = "cc", k = 7)+
+                       s(doy,bs = "cc", k = 52)+
+                       s(General_SES,k=4)+
+                         s(School,k=4)+s(Family_Values,k=4)+s(Family_Turmoil,k=4)+s(Dense_Urban_Poverty,k=4)+s(Extracurriculars,k=4)+s(Screen_Time,k=4)+
+                       s(age)+
+                       s(doy, abcd_site, bs = "fs", xt = list(bs="cc",k=26)) +
+                       osex,
+                     data = abcd.df,REML = TRUE)
+summary(gmod.exposome.covses)
+
+eta_squared(gmod.exposome.covses)
+effectsize::cohens_f_squared(gmod.exposome.covses)
+
+reduced.model <- bam(neurocog_pc1.bl~
+                       s(weekdaynum, bs = "cc", k = 7)+
+                       s(General_SES)+s(School,k=4)+s(Family_Values,k=4)+s(Family_Turmoil,k=4)+s(Dense_Urban_Poverty,k=4)+s(Extracurriculars,k=4)+s(Screen_Time,k=4)+
+                       s(age)+
+                       s(abcd_site, bs = "re") +
+                       osex,
+                     data = abcd.df,REML = TRUE)
+partialR2(gmod.exposome.covses,reduced.model)
+```
+
+#### Does DOY survive when propensity matching on exposome scores?
+```{r exposome doy propensity}
+set.seed(42)
+
+# Create a new binary variable for assessments in spring vs end of summer (pre-post summer break)
+# End of summer will be defined as the confidence interval for day of minimum performance: August 27 and September 25
+# August 27 is DOY 239. September 25 is DOY 268.
+
+abcd.df <- abcd.df %>%
+  mutate(
+    end_of_summer_vs_spring = case_when(
+      doy >= 239 & doy <= 268 ~ 1, # End of summer group
+      doy >= 32 & doy <= 151 ~ 0, # Spring group
+      TRUE ~ NA_real_           # All other DOYs are set to NA
+    )
+  )
+
+# Only keep the data for the two groups of interest
+abcd.df.sub <- abcd.df %>%
+  filter(!is.na(end_of_summer_vs_spring), !is.na(General_SES), !is.na(neurocog_pc1.bl))%>%
+  mutate(end_of_summer_vs_spring = factor(end_of_summer_vs_spring, labels = c("Spring", "End of Summer")))
+
+# Propensity Score Estimation across all exposome factors
+ps.model <- glm(end_of_summer_vs_spring ~ General_SES + age + osex +
+  School + Family_Values + Family_Turmoil + Dense_Urban_Poverty +
+  Extracurriculars + Screen_Time, data = abcd.df.sub, family = binomial)
+abcd.df.sub$pscore <- predict(ps.model, type = "response")
+summary(ps.model)
+
+# Use the propensity score to match individuals from the two groups
+matchit.out <- MatchIt::matchit(end_of_summer_vs_spring ~ pscore, data = abcd.df.sub, method = "nearest", ratio = 1)
+matched.data <- MatchIt::match.data(matchit.out)
+
+# Now, the main model can directly compare the two groups, adjusting for
+# any residual imbalance.
+gmod.exposome.matched <- bam(neurocog_pc1.bl ~
+  end_of_summer_vs_spring +
+  s(age) +
+  osex +
+  s(abcd_site, bs = "re") +
+  s(weekdaynum, bs = "cc", k = 7) +
+    General_SES + School + Family_Values + Family_Turmoil + Dense_Urban_Poverty +
+  Extracurriculars + Screen_Time,
+  data = matched.data,
+  REML = TRUE)
+
+summary(gmod.exposome.matched)
+eta_squared(gmod.exposome.matched)
+effectsize::cohens_f_squared(gmod.exposome.matched)
+sjPlot::plot_model(gmod.exposome.matched, type = "pred", terms = c("end_of_summer_vs_spring"),axis.labels = c("Spring", "End of Summer"),colors = "black") +
+  xlab("Assessment Time") +
+  ylab("General Cognition") +
+  ggtitle("ABCD: End of Summer vs Spring (Propensity Matched on Exposome)") + theme_classic()
+
+propensity_effect.plot <- ggeffects::ggemmeans(gmod.exposome.matched, terms = c("end_of_summer_vs_spring")) %>%
+  plot() +
+  xlab("Assessment Time") +
+  ylab("General Cognition") +
+  ggtitle("ABCD: End of Summer vs Spring\n (Propensity Matched on Exposome)") + theme_classic()
+propensity_effect.plot
+cowplot::save_plot("Figs/SES.ABCD.propensity.svg",propensity_effect.plot,base_width = 4, base_height = 4)
+
 ```
 
 #### Test general exposome with all cognitive factors and FDR
-```{r}
+```{r exposome all cog factors}
 long.exposome.abcd <- abcd.df %>% 
   pivot_longer(cols=c("General_SES"),
                names_to = "Exposome",values_to = "Exposome.value")%>%
@@ -3332,7 +3737,7 @@ ggplot(plot.data,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr,linetype = Exposome.value
   scale_linetype_manual(values = c(2,1)) +
   guides(linetype = guide_legend(title = "Exposome"))+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
-  theme(axis.text.x=element_text(angle=60,hjust = 1),
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),
         axis.title.x =  element_blank(),
         legend.position = "top")+
   ggtitle("ABCD")+
@@ -3387,7 +3792,7 @@ pnc.exposome <- ggplot(plot.df,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr,linetype = 
   scale_linetype_manual(values = c(2,1)) +
   guides(linetype = guide_legend(title = "Exposome"))+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
-  theme(axis.text.x=element_text(angle=60,hjust = 1),
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),
         axis.title.x =  element_blank(),
         legend.position = "top")+
   ylab("General Cognition")+
@@ -3398,7 +3803,7 @@ pnc.exposome2 <- ggplot(plot.df2,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr))+
   geom_ribbon(alpha=.25,color=NA,fill="#386cb0")+
   geom_line(color = "#386cb0")+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
-  theme(axis.text.x=element_text(angle=60,hjust = 1),
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),
         axis.title.x =  element_blank(),
         legend.position = "top")+
   ylab("General Cognition")+
@@ -3409,7 +3814,7 @@ cowplot::save_plot("Figs/SES.PNC.svg",pnc.exposome)
 ```
 
 #### Does participation date vary by general adversity? 
-```{r}
+```{r pnc.exposome doy anova}
 adversity.doy <- bam(GeneralExposome~
                        s(weekdaynum, bs = "cc", k = 7)+
                        ti(doy,age,k=c(26,10),bs=c("cc","ts"))+
@@ -3437,7 +3842,7 @@ adversity.doy.plot <- ggplot(plot.data,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr))+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
   scale_color_viridis_d(option = "inferno",aesthetics = c("fill","color"),begin = .6,end = .8)+
   # scale_fill_viridis_d()+
-  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
   ylab("Exposome")+ggtitle("PNC at median age of ABCD (9.9y)")
 adversity.doy.plot
 
@@ -3451,7 +3856,7 @@ cowplot::save_plot('Figs/ExposomeParticipantion.svg',doy.exposome.plot,base_widt
 
 
 #### All cognitive factors
-```{r}
+```{r, pnc.exposome all cog factors}
 long.exposome <- pnc %>% 
   pivot_longer(cols=c("GeneralExposome"),names_to = "Exposome",values_to = "Exposome.value")%>%
   pivot_longer(cols = contains("Effici"),names_to = "Factor",values_to = "Score")%>%
@@ -3493,7 +3898,7 @@ ggplot(plot.data,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr,linetype = Exposome.value
   scale_linetype_manual(values = c(2,1)) +
   guides(linetype = guide_legend(title = "Exposome"))+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month)) +
-  theme(axis.text.x=element_text(angle=60,hjust = 1),
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),
         axis.title.x =  element_blank(),
         legend.position = "top")+
   ggtitle("PNC: Median age of ABCD (9.9y)")+
@@ -3536,14 +3941,14 @@ ggplot(plot.data,aes(x=doy.raw,y=fit,ymin=lwr,ymax=upr,linetype = factor(General
   scale_linetype_manual(values = c(2,1))+
   scale_x_continuous(breaks = seq(1, 365, by = 120), labels = function(doy) sapply(doy, doy_to_month))+
   scale_color_viridis_d(option = "inferno",aesthetics = c("fill","color"),begin = .6,end = .8)+
-  theme(axis.text.x=element_text(angle=60,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
+  theme(axis.text.x=element_text(angle = 45,hjust = 1),axis.title.x =  element_blank(),legend.position = "top",legend.title.position = "top")+
   ylab("Performance")+ggtitle("PNC") + facet_grid(~age.raw)
 
 ```
 
 ## Generate Figure 5
 
-```{r}
+```{r fig5 combine exposome}
 (exposome.doy + adversity.doy.plot+plot_layout(axis_titles = "collect"))/(abcd.exposome+pnc.exposome+plot_layout(axis_titles = "collect_y"))
 
 participation.effect <- exposome.doy + adversity.doy.plot+plot_layout(axis_titles = "collect")+
@@ -3561,3 +3966,37 @@ combined.exosome.plot
 cowplot::save_plot('Figs/Fig5.Exposomes.svg',combined.exosome.plot,base_width = 8, base_height = 6)
 ```
 
+# Winter holiday
+In response to reviewer comments.  
+
+```{r winter holiday analysis}
+# Define the new groups for the Christmas holiday
+# December is DOY 335-365. January is DOY 1-31.
+abcd.df <- abcd.df %>%
+  mutate(
+    christmas_vs_january = case_when(
+      doy >= 330& doy <=354 ~ "December",   # December group
+      doy <= 25 ~ "January",    # January group
+      TRUE ~ "Other"
+    )
+  )
+
+# Subset the data for the two groups of interest
+abcd.df.sub_xmas <- abcd.df %>%
+  filter(christmas_vs_january %in% c("December", "January")) %>%
+  mutate(christmas_vs_january = as.factor(christmas_vs_january))
+
+# Run the analysis on this new subset
+gmod.xmas <- bam(neurocog_pc1.bl ~
+  christmas_vs_january +
+  s(age) +
+  osex +
+    s(General_SES,k=4)+
+  s(abcd_site, bs = "re") +
+  s(weekdaynum, bs = "cc", k = 7),
+  data = abcd.df.sub_xmas,
+  REML = TRUE)
+
+summary(gmod.xmas)
+
+```
