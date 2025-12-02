@@ -1,4 +1,4 @@
-# School’s Out for the Summer: Cognition Varies Across the Calendar Year in Multiple Large-Scale Datasets
+# Cognition Varies Across the Calendar Year in Multiple Large-Scale Datasets
 This contains the code used for all analyses and figures in the manuscript. 
 
 ## File organization 
@@ -75,6 +75,6 @@ The following datasets are required to run the analysis:
 ### **Instructions for running the code**
 1. Make sure all other dependencies are installed (as mentioned in the Installation Guide).
 
-2. Open and run the RMarkdown file (FirstSubmission_NHB.Rmd) in RStudio
+2. Open and run the RMarkdown file (Cognition_calendar.Rmd) in RStudio
 
 3. Running all the code will take ~20 minutes on a laptop computer. 
